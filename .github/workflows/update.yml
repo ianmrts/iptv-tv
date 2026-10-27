@@ -1,0 +1,19 @@
+name: Atualizar lista IPTV
+on:
+  schedule:
+    - cron: '0 5 * * *'   # todos os dias às 05:00 UTC
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash merge.sh
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add iptv.m3u
+          git diff --cached --quiet || git commit -m "Atualizar lista $(date -u +%F)"
+          git push
