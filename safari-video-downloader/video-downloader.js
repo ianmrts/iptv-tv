@@ -114,6 +114,18 @@
     setTimeout(function () { a.remove(); URL.revokeObjectURL(href); }, 120000);
   }
 
+  /* A galeria (Fotos) só recebe vídeo pela folha de compartilhar do iOS,
+     opção "Salvar Vídeo". Ela só aceita MP4/MOV. */
+  function galleryFile(out) {
+    var ext = out.name.split('.').pop();
+    var type = ext === 'mov' ? 'video/quicktime' : (ext === 'mp4' || ext === 'm4v') ? 'video/mp4' : '';
+    if (!type || typeof File !== 'function' || !navigator.share || !navigator.canShare) return null;
+    try {
+      var f = new File([out.blob], out.name, { type: type });
+      return navigator.canShare({ files: [f] }) ? f : null;
+    } catch (e) { return null; }
+  }
+
   async function fetchRetry(url, opts, tries) {
     tries = tries || 4;
     for (var i = 0; ; i++) {
@@ -174,8 +186,7 @@
       parts.push(new Uint8Array(await r.arrayBuffer()));
     }
     var blob = new Blob(parts, { type: type || 'video/mp4' });
-    saveBlob(blob, baseName() + '.' + extOf(item.url, type));
-    return fmtBytes(blob.size);
+    return { blob: blob, name: baseName() + '.' + extOf(item.url, type) };
   }
 
   /* ---------- HLS ---------- */
@@ -342,8 +353,7 @@
       if (mux) throw new Error('Falha ao converter para MP4');
       blob = new Blob(raw, { type: 'video/mp2t' }); ext = 'ts';
     }
-    saveBlob(blob, baseName() + '.' + ext);
-    return fmtBytes(blob.size) + (ext === 'ts' ? ' (.ts: abra no VLC)' : '');
+    return { blob: blob, name: baseName() + '.' + ext };
   }
 
   /* ---------- Painel ---------- */
@@ -536,7 +546,45 @@
         } else prompt('Copie o link:', item.url);
       };
 
+      var saveRow = el('div', 'row'); saveRow.style.marginTop = '8px'; saveRow.hidden = true; saveRow.style.display = 'none';
+      box.appendChild(saveRow);
+
+      /* Depois do download: botão para a galeria (precisa de um toque,
+         o iOS só abre a folha de compartilhar a partir de um toque). */
+      function offerSave(out) {
+        var size = fmtBytes(out.blob.size);
+        var file = galleryFile(out);
+        saveRow.textContent = '';
+        st.className = 's ok';
+        if (!file) {
+          saveBlob(out.blob, out.name);
+          st.textContent = 'Pronto: ' + size + '. Confirme "Baixar"; o arquivo fica em Arquivos > Downloads.' +
+            (/\.ts$/.test(out.name) ? ' A galeria não aceita .ts: abra no VLC.' :
+             /\.(webm|mkv)$/.test(out.name) ? ' A galeria não aceita este formato.' : '');
+          return;
+        }
+        var gal = el('button', '', 'Salvar na Galeria');
+        var fil = el('button', 'g', 'Salvar em Arquivos');
+        saveRow.appendChild(gal); saveRow.appendChild(fil);
+        saveRow.hidden = false; saveRow.style.display = '';
+        st.textContent = 'Pronto: ' + size + '. Toque em "Salvar na Galeria" e depois em "Salvar Vídeo".';
+        gal.onclick = function () {
+          navigator.share({ files: [file] }).then(function () {
+            st.className = 's ok'; st.textContent = 'Enviado. Se escolheu "Salvar Vídeo", ele está no app Fotos.';
+          }, function (e) {
+            if (e && e.name === 'AbortError') return; // fechou a folha sem escolher
+            st.className = 's e';
+            st.textContent = 'Não deu para abrir o compartilhamento. Use "Salvar em Arquivos" e, no app Arquivos, compartilhe › Salvar Vídeo.';
+          });
+        };
+        fil.onclick = function () {
+          saveBlob(out.blob, out.name);
+          st.className = 's ok'; st.textContent = 'Confirme "Baixar"; o arquivo fica em Arquivos > Downloads.';
+        };
+      }
+
       go.onclick = async function () {
+        saveRow.hidden = true; saveRow.style.display = 'none';
         var ctrl = new AbortController();
         var job = {
           signal: ctrl.signal, stopped: false,
@@ -556,10 +604,9 @@
           else ctrl.abort();
         };
         try {
-          var size = await (item.kind === 'hls' ? downloadHls(item, job) : downloadFile(item, job));
+          var out = await (item.kind === 'hls' ? downloadHls(item, job) : downloadFile(item, job));
           job.progress(1);
-          st.className = 's ok';
-          st.textContent = 'Pronto: ' + size + '. Confirme "Baixar"; o arquivo fica em Arquivos > Downloads.';
+          offerSave(out);
         } catch (e) {
           bar.style.display = 'none';
           st.className = 's e';

@@ -17,7 +17,7 @@ Um favorito (bookmarklet) que encontra os vídeos da página aberta e os salva n
 ## Usar
 
 Abra a página do vídeo, dê play por alguns segundos, digite *Baixar vídeo* na barra de endereço e toque no favorito.
-No painel, toque em **Baixar** e confirme. O arquivo vai para **Arquivos › Downloads**; para a galeria, abra-o e use compartilhar → **Salvar Vídeo**.
+No painel, toque em **Baixar**. Quando terminar, toque em **Salvar na Galeria** e escolha **Salvar Vídeo** na folha de compartilhar: o vídeo vai para o app Fotos. **Salvar em Arquivos** continua disponível. Arquivos `.ts`, WebM e MKV não entram na galeria e vão direto para Arquivos.
 
 Se o site bloquear o download pelo navegador (CORS), toque e segure no link azul e escolha **Baixar Arquivo Vinculado**, ou use **Copiar link**.
 
