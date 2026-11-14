@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Baixar Vídeo Safari</title>
+<style>
+  :root { --bg:#f2f2f7; --card:#fff; --fg:#1c1c1e; --muted:#6c6c70; --accent:#0a7aff; --ok:#248a3d; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#000; --card:#1c1c1e; --fg:#f2f2f7; --muted:#aeaeb2; --accent:#0a84ff; --ok:#30d158; }
+  }
+  :root[data-theme="dark"] { --bg:#000; --card:#1c1c1e; --fg:#f2f2f7; --muted:#aeaeb2; --accent:#0a84ff; --ok:#30d158; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin:14px 0; }
+  ol { margin:0; padding-left:22px; } li { margin:8px 0; }
+  button { font:inherit; font-weight:600; width:100%; border:0; border-radius:12px; padding:14px; background:var(--accent); color:#fff; }
+  .ok { color:var(--ok); text-align:center; min-height:1.4em; margin:8px 0 0; font-size:14px; }
+  textarea { width:100%; height:90px; margin-top:10px; font:12px ui-monospace, monospace; border-radius:10px; padding:8px;
+             background:var(--bg); color:var(--fg); border:1px solid color-mix(in srgb, var(--muted) 40%, transparent); }
+  h2 { font-size:17px; margin:0 0 8px; }
+  p, li { color:var(--fg); } .m { color:var(--muted); font-size:14px; }
+  a.bm { color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Baixar vídeo no Safari</h1>
+  <p class="sub">Um favorito que encontra o vídeo da página e salva no app Arquivos.</p>
+
+  <div class="card">
+    <button id="copy">1. Copiar código do favorito</button>
+    <p class="ok" id="msg"></p>
+    <textarea id="code" readonly></textarea>
+  </div>
+
+  <div class="card">
+    <h2>Instalar no iPhone</h2>
+    <ol>
+      <li>Copie o código no botão acima.</li>
+      <li>Toque em compartilhar (quadrado com seta para cima) e em <b>Adicionar Favorito</b>. Dê o nome <b>Baixar vídeo</b> e salve.</li>
+      <li>Abra os favoritos (ícone de livro), toque em <b>Editar</b> e no favorito <b>Baixar vídeo</b>.</li>
+      <li>Apague o endereço e cole o código copiado. Toque em <b>OK</b>.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Usar</h2>
+    <ol>
+      <li>Abra a página do vídeo e dê play por alguns segundos.</li>
+      <li>Toque na barra de endereço e digite <b>Baixar vídeo</b>; toque no favorito que aparecer (ou abra pelos favoritos).</li>
+      <li>No painel, toque em <b>Baixar</b> e confirme. O vídeo fica em <b>Arquivos › Downloads</b>. Para pôr na galeria, abra o arquivo, toque em compartilhar e em <b>Salvar Vídeo</b>.</li>
+    </ol>
+    <p class="m">Transmissões ao vivo (HLS): o painel grava até você tocar em <b>Parar e salvar</b>.
+      Vídeos com DRM (Netflix, Prime, Disney+ etc.) e streams criptografados não funcionam.
+      Vídeos muito longos podem esgotar a memória do iPhone. Baixe só conteúdo que você tem direito de salvar.</p>
+  </div>
+
+  <p class="m">No computador: arraste <a class="bm" id="drag" href="#">Baixar vídeo</a> para a barra de favoritos.</p>
+</main>
+<script>
+  var BM = __BOOKMARKLET_JSON__;
+  var ta = document.getElementById('code'), msg = document.getElementById('msg');
+  ta.value = BM;
+  document.getElementById('drag').href = BM;
+  document.getElementById('copy').onclick = function () {
+    function ok() { msg.textContent = 'Copiado. Agora siga os passos abaixo.'; }
+    function fallback() {
+      ta.focus(); ta.setSelectionRange(0, ta.value.length);
+      try { document.execCommand('copy') ? ok() : (msg.textContent = 'Selecione o texto abaixo e copie.'); }
+      catch (e) { msg.textContent = 'Selecione o texto abaixo e copie.'; }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(BM).then(ok, fallback);
+    else fallback();
+  };
+</script>
+</body>
+</html>
