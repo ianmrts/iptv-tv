@@ -103,15 +103,42 @@
     return 'mp4';
   }
 
+  /* O link fica dentro do painel (shadow DOM) e o clique não sobe para a
+     página: sites que interceptam cliques em links (SPA) recarregavam a
+     página em vez de baixar. */
   function saveBlob(blob, name) {
     var a = document.createElement('a');
     var href = URL.createObjectURL(blob);
     a.href = href;
     a.download = name;
     a.style.display = 'none';
-    document.body.appendChild(a);
+    a.addEventListener('click', function (e) { e.stopPropagation(); });
+    root.appendChild(a);
     a.click();
     setTimeout(function () { a.remove(); URL.revokeObjectURL(href); }, 120000);
+  }
+
+  /* Junta os pedaços em Blobs de ~8 MB conforme chegam. No Safari os dados
+     de um Blob saem da memória da aba, então o pico no fim fica bem menor
+     (aba sem memória = iOS recarrega a página e o download se perde). */
+  function Collector() {
+    var blobs = [], pend = [], pendBytes = 0;
+    this.size = 0;
+    this.count = 0;
+    this.push = function (u8) {
+      if (!u8 || !u8.length) return;
+      pend.push(u8); pendBytes += u8.length; this.size += u8.length; this.count++;
+      if (pendBytes >= 8388608) this.flush();
+    };
+    this.flush = function () {
+      if (pend.length) { blobs.push(new Blob(pend)); pend = []; pendBytes = 0; }
+    };
+    this.blob = function (head, type) {
+      this.flush();
+      var b = new Blob((head ? [head] : []).concat(blobs), { type: type });
+      blobs = [];
+      return b;
+    };
   }
 
   /* A galeria (Fotos) só recebe vídeo pela folha de compartilhar do iOS,
@@ -172,7 +199,7 @@
     var r = await fetchRetry(item.url, { signal: job.signal }, 2);
     var total = +r.headers.get('content-length') || 0;
     var type = r.headers.get('content-type') || '';
-    var parts = [], got = 0;
+    var parts = new Collector(), got = 0;
     if (r.body && r.body.getReader) {
       var reader = r.body.getReader();
       for (;;) {
@@ -184,8 +211,9 @@
       }
     } else {
       parts.push(new Uint8Array(await r.arrayBuffer()));
+      got = parts.size;
     }
-    var blob = new Blob(parts, { type: type || 'video/mp4' });
+    var blob = parts.blob(null, type || 'video/mp4');
     return { blob: blob, name: baseName() + '.' + extOf(item.url, type) };
   }
 
@@ -287,7 +315,7 @@
 
     var fmp4 = !!pl.map || /\.(m4s|mp4|m4v|cmfv)(\?|$)/i.test(pl.segments[0].url);
     var init = pl.map ? await fetchBytes(pl.map, job.signal) : null;
-    var mux = null, muxed = [], muxInit = null;
+    var mux = null, muxed = new Collector(), muxInit = null;
     if (!fmp4) {
       job.status('Carregando conversor MP4…');
       var muxjs = await loadMux();
@@ -299,7 +327,7 @@
         });
       }
     }
-    var raw = [];
+    var raw = new Collector();
     var bytes = 0, done = 0;
     function store(buf) {
       bytes += buf.length;
@@ -346,12 +374,12 @@
     job.status('Montando arquivo…');
     var blob, ext;
     if (fmp4) {
-      blob = new Blob([init || new Uint8Array(0)].concat(raw), { type: 'video/mp4' }); ext = 'mp4';
-    } else if (mux && muxInit && muxed.length) {
-      blob = new Blob([muxInit].concat(muxed), { type: 'video/mp4' }); ext = 'mp4';
+      blob = raw.blob(init, 'video/mp4'); ext = 'mp4';
+    } else if (mux && muxInit && muxed.count) {
+      blob = muxed.blob(muxInit, 'video/mp4'); ext = 'mp4';
     } else {
       if (mux) throw new Error('Falha ao converter para MP4');
-      blob = new Blob(raw, { type: 'video/mp2t' }); ext = 'ts';
+      blob = raw.blob(null, 'video/mp2t'); ext = 'ts';
     }
     return { blob: blob, name: baseName() + '.' + ext };
   }
@@ -398,6 +426,20 @@
     '<button class="g" data-a="scan">Atualizar</button><button class="g" data-a="close">Fechar</button></span></div>' +
     '<div class="list"></div></div>';
   var list = root.querySelector('.list');
+  // Toques no painel não chegam ao site (alguns reagem a qualquer clique)
+  ['click', 'touchstart', 'touchend', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'submit']
+    .forEach(function (t) { root.addEventListener(t, function (e) { e.stopPropagation(); }); });
+
+  /* Durante o download: pausa os vídeos do site e desliga as prévias,
+     para sobrar memória para o arquivo. */
+  function freeMemory() {
+    document.querySelectorAll('video, audio').forEach(function (v) { try { if (!v.paused) v.pause(); } catch (e) {} });
+    list.querySelectorAll('.th video').forEach(function (v) {
+      var th = v.parentNode;
+      v.removeAttribute('src'); v.load(); v.remove();
+      if (!th.style.backgroundImage) th.firstChild.textContent = '▶';
+    });
+  }
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -585,6 +627,7 @@
 
       go.onclick = async function () {
         saveRow.hidden = true; saveRow.style.display = 'none';
+        freeMemory();
         var ctrl = new AbortController();
         var job = {
           signal: ctrl.signal, stopped: false,
