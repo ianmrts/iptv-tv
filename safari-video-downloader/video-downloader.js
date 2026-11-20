@@ -156,6 +156,85 @@
     };
   }
 
+  /* ---------- Armazenamento das partes (para retomar) ----------
+     Cada parte baixada vai para o IndexedDB do Safari assim que chega, como
+     num torrent: se a conexão cair, a página recarregar ou você pausar, o
+     download continua de onde parou. As partes ficam no disco, não na
+     memória da aba. Sem IndexedDB (ex.: bloqueado), guarda na memória e só
+     retoma enquanto a página não recarregar. */
+  var S = (function () {
+    var memJobs = {}, memChunks = {}, dbp = null, useDb = true;
+    function ck(id, i) { return id + '\u0001' + (i < 0 ? 'init' : ('00000' + i).slice(-6)); }
+    function open() {
+      if (!dbp) dbp = new Promise(function (res) {
+        try {
+          var rq = indexedDB.open('__vdl', 1);
+          rq.onupgradeneeded = function () {
+            var d = rq.result;
+            if (!d.objectStoreNames.contains('jobs')) d.createObjectStore('jobs', { keyPath: 'id' });
+            if (!d.objectStoreNames.contains('chunks')) d.createObjectStore('chunks');
+          };
+          rq.onsuccess = function () { res(rq.result); };
+          rq.onerror = rq.onblocked = function () { res(null); };
+        } catch (e) { res(null); }
+        setTimeout(function () { res(null); }, 4000);
+      });
+      return dbp;
+    }
+    function rq(r) { return new Promise(function (res, rej) { r.onsuccess = function () { res(r.result); }; r.onerror = function () { rej(r.error); }; }); }
+    function done(t) { return new Promise(function (res, rej) { t.oncomplete = res; t.onerror = t.onabort = function () { rej(t.error); }; }); }
+    async function db() { if (!useDb) return null; var d = await open(); if (!d) useDb = false; return d; }
+    return {
+      persistent: function () { return useDb; },
+      putJob: async function (m) {
+        var d = await db();
+        if (d) { try { var t = d.transaction('jobs', 'readwrite'); t.objectStore('jobs').put(m); await done(t); return; } catch (e) { useDb = false; } }
+        memJobs[m.id] = JSON.parse(JSON.stringify(m));
+      },
+      jobs: async function () {
+        var out = Object.keys(memJobs).map(function (k) { return memJobs[k]; });
+        var d = await db();
+        if (d) { try { out = out.concat(await rq(d.transaction('jobs').objectStore('jobs').getAll())); } catch (e) {} }
+        return out;
+      },
+      put: async function (id, i, blob) {
+        var d = await db();
+        if (d) { try { var t = d.transaction('chunks', 'readwrite'); t.objectStore('chunks').put(blob, ck(id, i)); await done(t); return; } catch (e) { useDb = false; } }
+        memChunks[ck(id, i)] = blob;
+      },
+      get: async function (id, i) {
+        var k = ck(id, i);
+        if (memChunks[k]) return memChunks[k];
+        var d = await open();
+        return d ? rq(d.transaction('chunks').objectStore('chunks').get(k)) : null;
+      },
+      keys: async function (id) {
+        var pre = id + '\u0001', out = Object.keys(memChunks).filter(function (k) { return k.indexOf(pre) === 0; });
+        var d = await open();
+        if (d) { try { out = out.concat(await rq(d.transaction('chunks').objectStore('chunks').getAllKeys(IDBKeyRange.bound(pre, id + '\u0002')))); } catch (e) {} }
+        return out.map(function (k) { k = k.slice(pre.length); return k === 'init' ? -1 : parseInt(k, 10); });
+      },
+      del: async function (id) {
+        var pre = id + '\u0001';
+        delete memJobs[id];
+        Object.keys(memChunks).forEach(function (k) { if (k.indexOf(pre) === 0) delete memChunks[k]; });
+        var d = await open();
+        if (d) {
+          try {
+            var t = d.transaction(['jobs', 'chunks'], 'readwrite');
+            t.objectStore('jobs').delete(id);
+            t.objectStore('chunks').delete(IDBKeyRange.bound(pre, id + '\u0002'));
+            await done(t);
+          } catch (e) {}
+        }
+      }
+    };
+  })();
+
+  function jobId(url, choice) { return url + '|' + (choice || ''); }
+  function fatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
+  async function blobBytes(b) { return new Uint8Array(await new Response(b).arrayBuffer()); }
+
   /* A galeria (Fotos) só recebe vídeo pela folha de compartilhar do iOS,
      opção "Salvar Vídeo". Ela só aceita MP4/MOV. */
   function galleryFile(out) {
@@ -224,26 +303,70 @@
   /* ---------- Download de arquivo direto ---------- */
 
   async function downloadFile(item, job) {
-    job.status('Conectando…');
-    var r = await fetchRetry(item.url, { signal: job.signal }, 2);
-    var total = +r.headers.get('content-length') || 0;
-    var type = r.headers.get('content-type') || '';
-    var parts = new Collector(), got = 0;
+    var id = jobId(item.url);
+    var meta = (await S.jobs()).filter(function (m) { return m.id === id; })[0] ||
+      { id: id, kind: 'file', url: item.url, name: baseName(), t: Date.now(), n: 0, saved: 0, total: 0 };
+    if (meta.complete) { meta.n = 0; meta.saved = 0; meta.complete = false; await S.del(id); }
+    job.status(meta.saved ? 'Retomando de ' + fmtBytes(meta.saved) + '…' : 'Conectando…');
+    var opts = { signal: job.signal };
+    if (meta.saved) opts.headers = { Range: 'bytes=' + meta.saved + '-' };
+    var r = await fetchRetry(item.url, opts, 2);
+    var type = r.headers.get('content-type') || meta.type || '';
+    var total = 0;
+    if (meta.saved) {
+      var cr = /bytes\s+(\d+)-\d+\/(\d+|\*)/.exec(r.headers.get('content-range') || '');
+      var ok = r.status === 206 && (!cr || +cr[1] === meta.saved);
+      total = cr && cr[2] !== '*' ? +cr[2] : meta.total;
+      if (ok && meta.total && total && total !== meta.total) ok = false; // o arquivo mudou
+      if (!ok) {
+        // O servidor não aceita retomar: recomeça do zero com esta resposta
+        // (se ela for o arquivo inteiro) ou com um pedido novo.
+        await S.del(id);
+        meta.n = 0; meta.saved = 0;
+        if (r.status !== 200) { try { r.body && r.body.cancel(); } catch (e) {} r = await fetchRetry(item.url, { signal: job.signal }, 2); }
+        total = +r.headers.get('content-length') || 0;
+        job.status('Este servidor não permite retomar; recomeçando.');
+      }
+    } else {
+      total = +r.headers.get('content-length') || 0;
+    }
+    meta.total = total || meta.total; meta.type = type;
+    await S.putJob(meta);
+
+    var pend = [], pendBytes = 0;
+    async function flush() {
+      if (!pend.length) return;
+      await S.put(id, meta.n, new Blob(pend));
+      meta.n++; meta.saved += pendBytes; pend = []; pendBytes = 0;
+      job.saved = true;
+      await S.putJob(meta);
+    }
+    function prog() {
+      var got = meta.saved + pendBytes;
+      job.progress(meta.total ? got / meta.total : -1, fmtBytes(got) + (meta.total ? ' de ' + fmtBytes(meta.total) : ''));
+    }
     if (r.body && r.body.getReader) {
       var reader = r.body.getReader();
       for (;;) {
         var x = await reader.read();
         if (x.done) break;
-        parts.push(x.value);
-        got += x.value.length;
-        job.progress(total ? got / total : -1, fmtBytes(got) + (total ? ' de ' + fmtBytes(total) : ''));
+        pend.push(x.value); pendBytes += x.value.length;
+        if (pendBytes >= 4194304) await flush();
+        prog();
       }
     } else {
-      parts.push(new Uint8Array(await r.arrayBuffer()));
-      got = parts.size;
+      var all = new Uint8Array(await r.arrayBuffer());
+      pend.push(all); pendBytes = all.length;
     }
-    var blob = parts.blob(null, type || 'video/mp4');
-    return { blob: blob, name: baseName() + '.' + extOf(item.url, type) };
+    await flush();
+    if (meta.total && meta.saved < meta.total) throw new Error('A conexão caiu antes do fim');
+    meta.complete = true;
+    await S.putJob(meta);
+    job.status('Montando arquivo…');
+    var parts = [];
+    for (var i = 0; i < meta.n; i++) parts.push(await S.get(id, i));
+    var blob = new Blob(parts, { type: type || 'video/mp4' });
+    return { blob: blob, name: meta.name + '.' + extOf(item.url, type), id: id };
   }
 
   /* ---------- HLS ---------- */
@@ -322,97 +445,135 @@
     return q + (v.res ? ' (' + v.res + ')' : '') + (v.bw ? ' · ' + fmtRate(v.bw) : '');
   }
 
+  async function newMux(onData) {
+    if (skipMux) { job0.status('Sem conversor desta vez (a página recarregou ao carregá-lo).'); return null; }
+    job0.status('Carregando conversor MP4…');
+    var muxjs = await loadMux();
+    if (!muxjs) return null;
+    var mux = new muxjs.mp4.Transmuxer();
+    mux.on('data', onData);
+    return mux;
+  }
+  var job0 = null; // download em andamento (para mensagens do conversor)
+
   async function downloadHls(item, job) {
+    job0 = job;
     job.status('Lendo playlist…');
     var url = item.url;
     var text = await fetchText(url, job.signal);
-    if (!/^#EXTM3U/.test(text.trim())) throw new Error('Não é uma playlist HLS');
+    if (!/^#EXTM3U/.test(text.trim())) throw fatal('Não é uma playlist HLS');
     var note = '';
     if (/#EXT-X-STREAM-INF/.test(text)) {
       var m = parseMaster(text, url);
-      if (!m.variants.length) throw new Error('Playlist sem variantes de vídeo');
+      if (!m.variants.length) throw fatal('Playlist sem variantes de vídeo');
       var v = m.variants.filter(function (x) { return x.url === item.choice; })[0] || m.variants[0];
+      item.choice = v.url;
       if (m.audioSep) note = ' (áudio vem separado neste site; o vídeo pode ficar sem som)';
       url = v.url;
       job.status('Qualidade: ' + variantLabel(v) + note);
       text = await fetchText(url, job.signal);
     }
     var pl = parseMedia(text, url);
-    if (pl.key) throw new Error('Stream criptografado (' + pl.key + '), não suportado');
-    if (pl.byterange) throw new Error('Playlist com BYTERANGE, não suportada');
-    if (!pl.segments.length) throw new Error('Playlist vazia');
-
+    if (pl.key) throw fatal('Stream criptografado (' + pl.key + '), não suportado');
+    if (pl.byterange) throw fatal('Playlist com BYTERANGE, não suportada');
+    if (!pl.segments.length) throw fatal('Playlist vazia');
     var fmp4 = !!pl.map || /\.(m4s|mp4|m4v|cmfv)(\?|$)/i.test(pl.segments[0].url);
-    var init = pl.map ? await fetchBytes(pl.map, job.signal) : null;
-    var mux = null, muxed = new Collector(), muxInit = null;
-    if (!fmp4 && skipMux) {
-      job.status('Sem conversor desta vez (a página recarregou ao carregá-lo).');
-    } else if (!fmp4) {
-      job.status('Carregando conversor MP4…');
-      var muxjs = await loadMux();
-      if (muxjs) {
-        mux = new muxjs.mp4.Transmuxer();
-        mux.on('data', function (s) {
-          if (!muxInit) muxInit = s.initSegment;
-          muxed.push(new Uint8Array(s.data));
-        });
+    if (!pl.ended) return downloadLive(pl, url, fmp4, job, note);
+
+    /* VOD: cada parte vai para o armazenamento; ao retomar, baixa só as que faltam */
+    var id = jobId(item.url, item.choice);
+    var segs = pl.segments;
+    var meta = (await S.jobs()).filter(function (x) { return x.id === id; })[0];
+    if (meta && (meta.count !== segs.length || meta.complete)) { await S.del(id); meta = null; }
+    if (!meta) meta = { id: id, kind: 'hls', url: item.url, choice: item.choice || '', name: baseName(), t: Date.now(), count: segs.length, have: 0, bytes: 0 };
+    meta.fmp4 = fmp4;
+    await S.putJob(meta);
+    var have = {};
+    (await S.keys(id)).forEach(function (i) { have[i] = 1; });
+    if (pl.map && !have[-1]) await S.put(id, -1, new Blob([await fetchBytes(pl.map, job.signal)]));
+    var todo = [];
+    for (var i = 0; i < segs.length; i++) if (!have[i]) todo.push(i);
+    var got = segs.length - todo.length;
+    if (got) job.status('Retomando: ' + got + ' de ' + segs.length + ' partes já baixadas.');
+    var next = 0;
+    async function worker() {
+      while (next < todo.length && !job.signal.aborted) {
+        var k = todo[next++];
+        var b = await fetchBytes(segs[k].url, job.signal);
+        await S.put(id, k, new Blob([b]));
+        got++; meta.bytes += b.length; job.saved = true;
+        meta.have = got;
+        await S.putJob(meta);
+        job.progress(got / segs.length, got + '/' + segs.length + ' partes · ' + fmtBytes(meta.bytes) + note);
       }
     }
-    var raw = new Collector();
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    if (job.signal.aborted) throw new DOMException('Pausado', 'AbortError');
+    meta.have = got; meta.complete = true;
+    await S.putJob(meta);
+    return assembleHls(id, segs.length, fmp4, job);
+  }
+
+  /* Junta as partes guardadas. Segmentos .ts são convertidos um a um,
+     lendo do armazenamento, para não precisar de tudo na memória. */
+  async function assembleHls(id, count, fmp4, job) {
+    job.status('Montando arquivo…');
+    var name = ((await S.jobs()).filter(function (x) { return x.id === id; })[0] || {}).name || baseName();
+    var i, parts = [];
+    if (fmp4) {
+      var init = await S.get(id, -1);
+      if (init) parts.push(init);
+      for (i = 0; i < count; i++) parts.push(await S.get(id, i));
+      return { blob: new Blob(parts, { type: 'video/mp4' }), name: name + '.mp4', id: id };
+    }
+    var muxed = new Collector(), muxInit = null;
+    var mux = await newMux(function (sg) { if (!muxInit) muxInit = sg.initSegment; muxed.push(new Uint8Array(sg.data)); });
+    if (mux) {
+      for (i = 0; i < count; i++) {
+        mux.push(await blobBytes(await S.get(id, i)));
+        mux.flush();
+        job.progress((i + 1) / count, 'Convertendo para MP4… ' + (i + 1) + '/' + count);
+      }
+      if (!muxInit || !muxed.count) throw fatal('Falha ao converter para MP4');
+      return { blob: muxed.blob(muxInit, 'video/mp4'), name: name + '.mp4', id: id };
+    }
+    for (i = 0; i < count; i++) parts.push(await S.get(id, i));
+    return { blob: new Blob(parts, { type: 'video/mp2t' }), name: name + '.ts', id: id };
+  }
+
+  /* Ao vivo: grava até o usuário parar (não dá para retomar uma transmissão) */
+  async function downloadLive(pl, url, fmp4, job, note) {
+    var init = pl.map ? await fetchBytes(pl.map, job.signal) : null;
+    var muxed = new Collector(), muxInit = null, raw = new Collector();
+    var mux = fmp4 ? null : await newMux(function (sg) { if (!muxInit) muxInit = sg.initSegment; muxed.push(new Uint8Array(sg.data)); });
     var bytes = 0, done = 0;
     function store(buf) {
       bytes += buf.length;
       if (mux) { mux.push(buf); mux.flush(); } else raw.push(buf);
     }
-
-    if (pl.ended) {
-      // VOD: baixa em paralelo (4 de cada vez) mantendo a ordem
-      var segs = pl.segments, results = new Array(segs.length), next = 0, written = 0;
-      async function worker() {
-        while (next < segs.length && !job.signal.aborted) {
-          var i = next++;
-          results[i] = await fetchBytes(segs[i].url, job.signal);
-          done++;
-          while (written < segs.length && results[written]) { store(results[written]); results[written] = null; written++; }
-          job.progress(done / segs.length, done + '/' + segs.length + ' partes · ' + fmtBytes(bytes) + note);
-        }
+    var last = -1, startedAt = Date.now(), firstRound = true;
+    job.live(true);
+    while (!job.stopped && !job.signal.aborted) {
+      var fresh = pl.segments.filter(function (s) { return s.seq > last; });
+      if (firstRound && fresh.length > 3) fresh = fresh.slice(-3); // começa perto do "agora"
+      firstRound = false;
+      for (var k = 0; k < fresh.length && !job.signal.aborted && !job.stopped; k++) {
+        try { store(await fetchBytes(fresh[k].url, job.signal)); done++; } catch (e) { if (job.signal.aborted) break; }
+        last = fresh[k].seq;
+        var secs = Math.round((Date.now() - startedAt) / 1000);
+        job.progress(-1, 'Gravando ' + Math.floor(secs / 60) + ':' + ('0' + secs % 60).slice(-2) + ' · ' + fmtBytes(bytes) + note);
       }
-      await Promise.all([worker(), worker(), worker(), worker()]);
-      if (job.signal.aborted) throw new Error('Cancelado');
-    } else {
-      // Ao vivo: grava até o usuário parar
-      var last = -1, startedAt = Date.now();
-      job.live(true);
-      var firstRound = true;
-      while (!job.stopped && !job.signal.aborted) {
-        var fresh = pl.segments.filter(function (s) { return s.seq > last; });
-        if (firstRound && fresh.length > 3) fresh = fresh.slice(-3); // começa perto do "agora"
-        firstRound = false;
-        for (var k = 0; k < fresh.length && !job.signal.aborted && !job.stopped; k++) {
-          try { store(await fetchBytes(fresh[k].url, job.signal)); done++; } catch (e) { if (job.signal.aborted) break; }
-          last = fresh[k].seq;
-          var secs = Math.round((Date.now() - startedAt) / 1000);
-          job.progress(-1, 'Gravando ' + Math.floor(secs / 60) + ':' + ('0' + secs % 60).slice(-2) + ' · ' + fmtBytes(bytes) + note);
-        }
-        if (job.stopped || pl.ended) break;
-        await sleep(Math.max(1000, pl.target * 500));
-        try { pl = parseMedia(await fetchText(url, job.signal), url); } catch (e) { if (job.signal.aborted) break; }
-      }
-      if (job.signal.aborted && !job.stopped) throw new Error('Cancelado');
-      if (!done) throw new Error('Nada gravado');
+      if (job.stopped || pl.ended) break;
+      await sleep(Math.max(1000, pl.target * 500));
+      try { pl = parseMedia(await fetchText(url, job.signal), url); } catch (e) { if (job.signal.aborted) break; }
     }
-
+    if (job.signal.aborted && !job.stopped) throw new DOMException('Cancelado', 'AbortError');
+    if (!done) throw fatal('Nada gravado');
     job.status('Montando arquivo…');
-    var blob, ext;
-    if (fmp4) {
-      blob = raw.blob(init, 'video/mp4'); ext = 'mp4';
-    } else if (mux && muxInit && muxed.count) {
-      blob = muxed.blob(muxInit, 'video/mp4'); ext = 'mp4';
-    } else {
-      if (mux) throw new Error('Falha ao converter para MP4');
-      blob = raw.blob(null, 'video/mp2t'); ext = 'ts';
-    }
-    return { blob: blob, name: baseName() + '.' + ext };
+    if (fmp4) return { blob: raw.blob(init, 'video/mp4'), name: baseName() + '.mp4' };
+    if (mux && muxInit && muxed.count) return { blob: muxed.blob(muxInit, 'video/mp4'), name: baseName() + '.mp4' };
+    if (mux) throw fatal('Falha ao converter para MP4');
+    return { blob: raw.blob(null, 'video/mp2t'), name: baseName() + '.ts' };
   }
 
   /* ---------- Painel ---------- */
@@ -480,8 +641,29 @@
   }
 
   var jobs = [];
-  function render() {
+  var finishedHere = {}; // downloads concluídos neste painel: as partes ainda são usadas para salvar
+  var renderSeq = 0;
+  async function render() {
+    var seq = ++renderSeq;
     var res = collect();
+    /* Downloads guardados: apaga os concluídos de antes e os muito antigos;
+       os incompletos aparecem com "Continuar". */
+    var stored = [];
+    try { stored = await S.jobs(); } catch (e) {}
+    if (seq !== renderSeq) return;
+    var partial = {};
+    stored.forEach(function (m) {
+      if (finishedHere[m.id]) return;
+      if (m.complete || Date.now() - m.t > 7 * 864e5) { S.del(m.id); return; }
+      partial[m.url] = m;
+    });
+    Object.keys(partial).forEach(function (u) {
+      var m = partial[u];
+      var it = res.items.filter(function (x) { return x.url === u; })[0];
+      if (!it) { it = { url: u, kind: m.kind, label: 'incompleto', poster: null }; res.items.unshift(it); }
+      it.partial = m;
+      it.choice = m.choice || it.choice;
+    });
     list.querySelectorAll('video').forEach(function (v) { v.removeAttribute('src'); v.load(); });
     list.textContent = '';
     if (lastCrash) {
@@ -495,10 +677,10 @@
       if (res.blobs) list.appendChild(el('p', 'n', 'O player usa blob:, então o link real só aparece depois que o vídeo começa a carregar.'));
       return;
     }
-    // HLS master/arquivos do player primeiro
+    // Incompletos primeiro, depois HLS/arquivos do player
     res.items.sort(function (a, b) {
-      var sa = (a.label === 'player' ? 0 : 2) + (a.kind === 'hls' ? 0 : 1);
-      var sb = (b.label === 'player' ? 0 : 2) + (b.kind === 'hls' ? 0 : 1);
+      var sa = (a.partial ? -4 : 0) + (a.label === 'player' ? 0 : 2) + (a.kind === 'hls' ? 0 : 1);
+      var sb = (b.partial ? -4 : 0) + (b.label === 'player' ? 0 : 2) + (b.kind === 'hls' ? 0 : 1);
       return sa - sb;
     });
     var boxes = {}, previews = 0;
@@ -515,6 +697,7 @@
       var head = el('div');
       head.appendChild(el('span', 'tag', item.kind === 'hls' ? 'HLS' : extOf(item.url)));
       if (item.label) head.appendChild(el('span', 'tag', item.label));
+      if (item.partial && item.label !== 'incompleto') head.appendChild(el('span', 'tag live', 'incompleto'));
       var qline = el('div', 'q');
       var a = el('a', 'u', item.url);
       a.href = item.url; a.target = '_blank'; a.rel = 'noopener';
@@ -556,15 +739,21 @@
               m.variants.forEach(function (v) { hide(v.url); });
               m.audio.forEach(hide);
               if (!m.variants.length) return;
-              item.choice = m.variants[0].url;
-              Object.assign(q, { h: m.variants[0].h, res: m.variants[0].res, bw: m.variants[0].bw });
+              var cur = m.variants.filter(function (v) { return v.url === item.choice; })[0] || m.variants[0];
+              item.choice = cur.url;
+              Object.assign(q, { h: cur.h, res: cur.res, bw: cur.bw });
               if (m.variants.length > 1) {
                 m.variants.forEach(function (v) {
                   var o = el('option', '', variantLabel(v)); o.value = v.url; sel.appendChild(o);
                 });
+                sel.value = cur.url;
                 sel.hidden = false; sel.style.display = '';
                 sel.onchange = function () {
                   var v = m.variants[sel.selectedIndex];
+                  if (item.partial && item.partial.choice !== v.url) {
+                    st.className = 's'; st.textContent = 'O download incompleto é de outra qualidade; esta começa do zero.';
+                    idle(null);
+                  } else if (item.partial) idle(pctOf(item.partial));
                   item.choice = v.url;
                   Object.assign(q, { h: v.h, res: v.res, bw: v.bw });
                   showInfo();
@@ -572,7 +761,7 @@
                 head.appendChild(el('span', 'tag hd', m.variants.length + ' qualidades'));
               }
               showInfo();
-              await mediaInfo(m.variants[0].url);
+              await mediaInfo(cur.url);
             } else if (/#EXTINF/.test(t)) {
               var pl = parseMedia(t, item.url);
               q.live = !pl.ended;
@@ -608,14 +797,47 @@
       }
       var row = el('div', 'row');
       var go = el('button', '', 'Baixar');
-      var stop = el('button', 'r', 'Cancelar'); stop.style.display = 'none';
+      var stop = el('button', 'g', 'Pausar'); stop.style.display = 'none';
+      var discard = el('button', 'r', 'Descartar'); discard.style.display = 'none';
       var copy = el('button', 'g', 'Copiar link');
-      row.appendChild(go); row.appendChild(stop); row.appendChild(copy);
+      row.appendChild(go); row.appendChild(stop); row.appendChild(discard); row.appendChild(copy);
       box.appendChild(row);
       var bar = el('div', 'bar'); bar.appendChild(el('i'));
       var st = el('div', 's');
       box.appendChild(bar); box.appendChild(st);
       list.appendChild(box);
+
+      function pctOf(m) {
+        var f = m.kind === 'hls' ? (m.count ? m.have / m.count : 0) : (m.total ? m.saved / m.total : 0);
+        return Math.min(99, Math.floor(f * 100));
+      }
+      /* Parado: "Baixar", ou "Continuar (N%)" + "Descartar" se há partes guardadas */
+      function idle(pct) {
+        go.disabled = false;
+        stop.style.display = 'none'; stop.disabled = false;
+        if (pct != null) {
+          go.textContent = 'Continuar (' + pct + '%)';
+          discard.style.display = '';
+          bar.style.display = 'block'; bar.classList.remove('ind'); bar.firstChild.style.width = pct + '%';
+        } else {
+          go.textContent = 'Baixar';
+          discard.style.display = 'none';
+        }
+      }
+      if (item.partial) {
+        idle(pctOf(item.partial));
+        st.className = 's';
+        st.textContent = 'Download incompleto' + (item.partial.name ? ' ("' + item.partial.name + '")' : '') +
+          '. Toque em Continuar para baixar só o que falta.';
+      }
+      discard.onclick = async function () {
+        var ms = (await S.jobs()).filter(function (m) { return m.url === item.url && !finishedHere[m.id]; });
+        for (var i = 0; i < ms.length; i++) await S.del(ms[i].id);
+        item.partial = null;
+        idle(null);
+        bar.style.display = 'none';
+        st.className = 's'; st.textContent = 'Partes apagadas.';
+      };
 
       copy.onclick = function () {
         var done = function () { st.className = 's ok'; st.textContent = 'Link copiado.'; };
@@ -666,38 +888,69 @@
         freeMemory();
         var ctrl = new AbortController();
         var job = {
-          signal: ctrl.signal, stopped: false,
+          signal: ctrl.signal, stopped: false, saved: !!item.partial, frac: item.partial ? pctOf(item.partial) / 100 : 0,
           status: function (t) { st.className = 's'; st.textContent = t; mark(t); },
           progress: function (f, t) {
+            if (f >= 0) job.frac = f;
             bar.style.display = 'block';
             bar.classList.toggle('ind', f < 0);
             bar.firstChild.style.width = f < 0 ? '' : Math.round(f * 100) + '%';
             if (t) { st.className = 's'; st.textContent = t; }
           },
-          live: function () { stop.textContent = 'Parar e salvar'; stop.className = ''; }
+          live: function () { job.isLive = true; stop.textContent = 'Parar e salvar'; stop.className = ''; }
         };
         jobs.push(ctrl);
-        go.disabled = true; stop.style.display = ''; stop.textContent = 'Cancelar'; stop.className = 'r';
+        go.disabled = true; discard.style.display = 'none';
+        stop.style.display = ''; stop.textContent = 'Pausar'; stop.className = 'g';
         stop.onclick = function () {
-          if (stop.textContent === 'Parar e salvar') { job.stopped = true; stop.disabled = true; }
+          if (job.isLive) { job.stopped = true; stop.disabled = true; }
           else ctrl.abort();
         };
-        try {
-          var out = await (item.kind === 'hls' ? downloadHls(item, job) : downloadFile(item, job));
+        var out = null, err = null, paused = false;
+        for (var attempt = 0; ; attempt++) {
+          try {
+            out = await (item.kind === 'hls' ? downloadHls(item, job) : downloadFile(item, job));
+            break;
+          } catch (e) {
+            if (ctrl.signal.aborted) { paused = true; break; }
+            var msg = (e && e.message) || '';
+            // Erro de rede no meio: tenta continuar sozinho (3 vezes).
+            // Sem nada baixado, um TypeError costuma ser bloqueio do site (CORS).
+            var retry = !e.fatal && attempt < 3 && !/HTTP 4\d\d/.test(msg) && (job.saved || !(e instanceof TypeError));
+            if (!retry) { err = e; break; }
+            for (var w = [3, 6, 12][attempt]; w > 0 && !ctrl.signal.aborted; w--) {
+              st.className = 's'; st.textContent = 'A conexão falhou. Continuando em ' + w + ' s… (' + Math.floor(job.frac * 100) + '% já guardado)';
+              await sleep(1000);
+            }
+            if (ctrl.signal.aborted) { paused = true; break; }
+          }
+        }
+        unmark();
+        var pct = job.saved && !job.isLive ? Math.min(99, Math.floor(job.frac * 100)) : null;
+        if (out) {
+          if (out.id) finishedHere[out.id] = 1;
+          item.partial = null;
+          idle(null);
           job.progress(1);
           offerSave(out);
-        } catch (e) {
-          bar.style.display = 'none';
-          st.className = 's e';
-          var m = (e && e.message) || String(e);
-          if (e && (e.name === 'AbortError' || ctrl.signal.aborted)) m = 'Cancelado.';
-          else if (e instanceof TypeError || /fetch|Load failed|NetworkError/i.test(m))
-            m = 'O site bloqueou o download pelo navegador. Toque e segure no link azul acima e escolha "Baixar Arquivo Vinculado" (só para arquivos diretos), ou copie o link.';
-          st.textContent = m;
-        } finally {
-          unmark();
-          go.disabled = false; stop.style.display = 'none'; stop.disabled = false;
+          return;
         }
+        idle(pct);
+        if (paused) {
+          st.className = 's';
+          st.textContent = pct != null ? 'Pausado. O que já baixou está guardado; toque em Continuar.' : 'Cancelado.';
+          if (pct == null) bar.style.display = 'none';
+          return;
+        }
+        st.className = 's e';
+        var m = (err && err.message) || String(err);
+        if (err instanceof TypeError || /fetch|Load failed|NetworkError/i.test(m))
+          m = pct != null ? 'A conexão caiu.' :
+            'O site bloqueou o download pelo navegador. Toque e segure no link azul acima e escolha "Baixar Arquivo Vinculado" (só para arquivos diretos), ou copie o link.';
+        if (pct != null) m += ' O que já baixou (' + pct + '%) está guardado: toque em "Continuar" quando quiser' +
+          (S.persistent() ? ', mesmo depois de recarregar a página.' : '.');
+        else bar.style.display = 'none';
+        st.textContent = m;
       };
     });
   }

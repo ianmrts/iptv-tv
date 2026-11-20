@@ -1,0 +1,7 @@
+{
+  "name": "safari-video-downloader",
+  "private": true,
+  "description": "Bookmarklet para baixar vídeos no Safari do iPhone",
+  "scripts": { "build": "node build.js" },
+  "devDependencies": { "terser": "5.36.0" }
+}
