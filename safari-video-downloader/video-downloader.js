@@ -23,6 +23,21 @@
 
   if (window.__vdl) { window.__vdl.close(); return; }
 
+  /* Se a página recarregar no meio do download, a etapa fica guardada na
+     aba (sessionStorage) e o painel avisa na próxima vez. */
+  var LAST_KEY = '__vdl_last';
+  var lastCrash = null;
+  try {
+    var lc = JSON.parse(sessionStorage.getItem(LAST_KEY) || 'null');
+    if (lc && Date.now() - lc.t < 15 * 60000) lastCrash = lc;
+    sessionStorage.removeItem(LAST_KEY);
+  } catch (e) {}
+  var skipMux = !!(lastCrash && /conversor/i.test(lastCrash.step));
+  function mark(step) {
+    try { sessionStorage.setItem(LAST_KEY, JSON.stringify({ step: step, t: Date.now() })); } catch (e) {}
+  }
+  function unmark() { try { sessionStorage.removeItem(LAST_KEY); } catch (e) {} }
+
   /* ---------- Coleta de vídeos na página ---------- */
 
   function abs(u, base) {
@@ -181,12 +196,26 @@
     if (window.muxjs) return Promise.resolve(window.muxjs);
     if (!muxPromise) {
       muxPromise = new Promise(function (res) {
+        // Sites com require.js (AMD) "engoliam" o conversor: esconde o
+        // define() enquanto ele carrega, para ele se registrar em window.muxjs.
+        var amd = window.define && window.define.amd ? window.define : null;
+        if (amd) window.define = undefined;
+        var finished = false;
+        function done() {
+          if (finished) return;
+          finished = true;
+          if (amd && window.define === undefined) window.define = amd;
+          res(window.muxjs || null);
+        }
         var s = document.createElement('script');
         s.src = MUXJS_URL;
-        s.onload = function () { res(window.muxjs || null); };
-        s.onerror = function () { res(null); };
-        setTimeout(function () { res(window.muxjs || null); }, 15000);
-        (document.head || document.documentElement).appendChild(s);
+        s.onload = done;
+        s.onerror = done;
+        setTimeout(done, 12000);
+        // O script vai dentro do painel (shadow DOM): roda normalmente, mas
+        // o site não o enxerga. Alguns sites recarregam a página quando
+        // aparece um script novo.
+        root.appendChild(s);
       });
     }
     return muxPromise;
@@ -316,7 +345,9 @@
     var fmp4 = !!pl.map || /\.(m4s|mp4|m4v|cmfv)(\?|$)/i.test(pl.segments[0].url);
     var init = pl.map ? await fetchBytes(pl.map, job.signal) : null;
     var mux = null, muxed = new Collector(), muxInit = null;
-    if (!fmp4) {
+    if (!fmp4 && skipMux) {
+      job.status('Sem conversor desta vez (a página recarregou ao carregá-lo).');
+    } else if (!fmp4) {
       job.status('Carregando conversor MP4…');
       var muxjs = await loadMux();
       if (muxjs) {
@@ -453,6 +484,11 @@
     var res = collect();
     list.querySelectorAll('video').forEach(function (v) { v.removeAttribute('src'); v.load(); });
     list.textContent = '';
+    if (lastCrash) {
+      list.appendChild(el('p', 's e', 'Da última vez a página recarregou durante "' + lastCrash.step + '". ' +
+        (skipMux ? 'Agora o vídeo será salvo sem conversão: sai em .ts (abre no VLC, mas não entra na galeria).'
+                 : 'Provavelmente faltou memória no iPhone: escolha uma qualidade menor.')));
+    }
     if (!res.items.length) {
       var msg = el('p', 'n', 'Nenhum vídeo encontrado. Dê play no vídeo, espere alguns segundos e toque em "Atualizar".');
       list.appendChild(msg);
@@ -631,7 +667,7 @@
         var ctrl = new AbortController();
         var job = {
           signal: ctrl.signal, stopped: false,
-          status: function (t) { st.className = 's'; st.textContent = t; },
+          status: function (t) { st.className = 's'; st.textContent = t; mark(t); },
           progress: function (f, t) {
             bar.style.display = 'block';
             bar.classList.toggle('ind', f < 0);
@@ -659,6 +695,7 @@
             m = 'O site bloqueou o download pelo navegador. Toque e segure no link azul acima e escolha "Baixar Arquivo Vinculado" (só para arquivos diretos), ou copie o link.';
           st.textContent = m;
         } finally {
+          unmark();
           go.disabled = false; stop.style.display = 'none'; stop.disabled = false;
         }
       };
