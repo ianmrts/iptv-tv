@@ -7,6 +7,8 @@ Um favorito (bookmarklet) que encontra os vídeos da página aberta e os salva n
   (segmentos `.ts` são convertidos com [mux.js](https://github.com/videojs/mux.js); se o site não deixar carregar o script, sai um `.ts`, que abre no VLC).
 - **Ao vivo (HLS)**: grava até você tocar em *Parar e salvar*. Serve para os canais do `iptv.m3u` deste repositório.
 - **Retomar, como num torrent**: cada parte baixada fica guardada no Safari. Se a conexão cair, o painel continua sozinho de onde parou; você também pode **Pausar** e **Continuar**. Se a página recarregar ou a aba fechar, abra o painel de novo na mesma página e toque em **Continuar** (o download aparece como *incompleto*). Arquivos diretos retomam pelo byte onde pararam (quando o servidor permite); HLS baixa só as partes que faltam. Transmissões ao vivo não têm como retomar.
+- **Partes que não baixam**: se uma parte falha, as outras continuam e ela é tentada de novo no fim. Se poucas partes falharem sempre, aparece **Salvar sem as partes que falharam** (o vídeo pula esses trechos).
+- **Duração certa**: streams com anúncios ou trechos emendados têm saltos no relógio do vídeo; o painel emenda cada trecho no fim do anterior, para o arquivo não ficar com tempo preto ou duração errada.
 - Não funciona com DRM (Netflix, Prime, Disney+…) nem com streams criptografados. Vídeos muito longos podem esgotar a memória do iPhone.
 
 ## Instalar

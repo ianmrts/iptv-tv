@@ -379,18 +379,21 @@
   function parseMedia(text, url) {
     var lines = text.split(/\r?\n/);
     var p = { segments: [], seq: 0, target: 6, ended: /#EXT-X-ENDLIST/.test(text), map: null, key: null, byterange: false };
-    var seq = null;
+    var seq = null, dur = 0, disc = false;
     lines.forEach(function (l) {
       l = l.trim();
       if (!l) return;
-      if (l.indexOf('#EXT-X-MEDIA-SEQUENCE:') === 0) p.seq = parseInt(l.slice(22), 10) || 0;
+      if (l.indexOf('#EXTINF:') === 0) dur = parseFloat(l.slice(8)) || 0;
+      else if (l.indexOf('#EXT-X-DISCONTINUITY') === 0 && l.indexOf('SEQUENCE') < 0) disc = true;
+      else if (l.indexOf('#EXT-X-MEDIA-SEQUENCE:') === 0) p.seq = parseInt(l.slice(22), 10) || 0;
       else if (l.indexOf('#EXT-X-TARGETDURATION:') === 0) p.target = parseFloat(l.slice(22)) || 6;
       else if (l.indexOf('#EXT-X-MAP:') === 0) p.map = abs(attr(l, 'URI'), url);
       else if (l.indexOf('#EXT-X-KEY:') === 0) { var m = attr(l, 'METHOD'); if (m && m !== 'NONE') p.key = m; }
       else if (l.indexOf('#EXT-X-BYTERANGE') === 0) p.byterange = true;
       else if (l[0] !== '#') {
         if (seq === null) seq = p.seq;
-        p.segments.push({ url: abs(l, url), seq: seq++ });
+        p.segments.push({ url: abs(l, url), seq: seq++, dur: dur, disc: disc });
+        dur = 0; disc = false;
       }
     });
     return p;
@@ -445,15 +448,195 @@
     return q + (v.res ? ' (' + v.res + ')' : '') + (v.bw ? ' · ' + fmtRate(v.bw) : '');
   }
 
-  async function newMux(onData) {
+  /* ---------- Linha do tempo contínua ----------
+     Streams com anúncios ou trechos emendados têm "descontinuidades": o
+     relógio do vídeo pula para frente (vira tempo preto no arquivo) ou volta
+     a zero (vira uma duração enorme, tipo 12h). Antes de juntar cada parte,
+     o tempo dela é reposicionado logo depois da anterior. */
+  var PTS_WRAP = 8589934592; // 2^33 (relógio de 90 kHz do MPEG-TS)
+
+  // Primeiro PTS de vídeo (ou de áudio, se não houver vídeo) de um segmento .ts
+  function firstPts(u8) {
+    var audio = null;
+    for (var o = 0; o + 188 <= u8.length; o += 188) {
+      if (u8[o] !== 0x47) { var n = u8.indexOf(0x47, o + 1); if (n < 0) break; o = n - 188; continue; }
+      if (!(u8[o + 1] & 0x40)) continue;
+      var afc = (u8[o + 3] >> 4) & 3, q = o + 4;
+      if (afc === 2) continue;
+      if (afc === 3) q += 1 + u8[q];
+      if (q + 14 > o + 188 || u8[q] !== 0 || u8[q + 1] !== 0 || u8[q + 2] !== 1 || !(u8[q + 7] & 0x80)) continue;
+      var sid = u8[q + 3], b = q + 9;
+      var pts = ((u8[b] >> 1) & 7) * 1073741824 + u8[b + 1] * 4194304 + (u8[b + 2] >> 1) * 32768 + u8[b + 3] * 128 + (u8[b + 4] >> 1);
+      if (sid >= 0xE0 && sid <= 0xEF) return pts;
+      if (sid >= 0xC0 && sid <= 0xDF && audio === null) audio = pts;
+    }
+    return audio;
+  }
+
+  function concatU8(list) {
+    var n = 0, o, p = 0;
+    list.forEach(function (a) { n += a.length; });
+    o = new Uint8Array(n);
+    list.forEach(function (a) { o.set(a, p); p += a.length; });
+    return o;
+  }
+
+  /* Conversor .ts -> MP4 (mux.js) com linha do tempo contínua. Quando o
+     relógio pula (descontinuidade marcada, salto de PTS ou parte faltando),
+     reinicia o relógio do conversor (senão ele descarta os quadros quando o
+     relógio volta para trás) e depois emenda o trecho no fim do anterior
+     com o fmp4Fixer. */
+  async function tsConverter() {
     if (skipMux) { job0.status('Sem conversor desta vez (a página recarregou ao carregá-lo).'); return null; }
     job0.status('Carregando conversor MP4…');
     var muxjs = await loadMux();
     if (!muxjs) return null;
-    var mux = new muxjs.mp4.Transmuxer();
-    mux.on('data', onData);
-    return mux;
+    var mux = new muxjs.mp4.Transmuxer(), init = null, buf = [], fx = null, out = new Collector();
+    mux.on('data', function (sg) { if (!init) init = new Uint8Array(sg.initSegment); buf.push(new Uint8Array(sg.data)); });
+    var prevPts = null, prevDur = 0, first = true, force = false;
+    return {
+      push: function (u8, dur, disc) {
+        var pts = firstPts(u8), reset = false;
+        if (!first) {
+          var cont = !disc && !force && pts !== null && prevPts !== null;
+          if (cont) {
+            var d = ((pts - prevPts) % PTS_WRAP + PTS_WRAP) % PTS_WRAP;
+            cont = Math.abs(d - prevDur * 90000) <= 5 * 90000;
+          }
+          if (!cont) { reset = true; mux.setBaseMediaDecodeTime(0); }
+        }
+        buf = [];
+        mux.push(u8); mux.flush();
+        if (buf.length) {
+          if (!fx) fx = fmp4Fixer(init);
+          var seg = concatU8(buf);
+          out.push(fx.fix(seg, dur, reset).data);
+        }
+        prevPts = pts; prevDur = dur || prevDur; first = false; force = false;
+      },
+      skip: function () { force = true; },
+      blob: function () { return init && out.count ? out.blob(setInitDuration(init, fx.end()), 'video/mp4') : null; }
+    };
   }
+
+  // fMP4: lê as escalas de tempo (timescale) de cada trilha no init
+  function boxes(u8, start, end, cb) {
+    var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    for (var o = start; o + 8 <= end;) {
+      var size = dv.getUint32(o), type = String.fromCharCode(u8[o + 4], u8[o + 5], u8[o + 6], u8[o + 7]), h = 8;
+      if (size === 1) { size = dv.getUint32(o + 8) * 4294967296 + dv.getUint32(o + 12); h = 16; }
+      else if (size === 0) size = end - o;
+      if (size < 8 || o + size > end) break;
+      cb(type, o, o + h, o + size, dv);
+      o += size;
+    }
+  }
+  function timescales(init) {
+    var ts = {};
+    if (!init) return ts;
+    boxes(init, 0, init.length, function (t, o, b, e) {
+      if (t !== 'moov') return;
+      boxes(init, b, e, function (t2, o2, b2, e2) {
+        if (t2 !== 'trak') return;
+        var id = null, scale = null;
+        boxes(init, b2, e2, function (t3, o3, b3, e3, dv) {
+          if (t3 === 'tkhd') id = dv.getUint32(b3 + (init[b3] === 1 ? 20 : 12));
+          if (t3 === 'mdia') boxes(init, b3, e3, function (t4, o4, b4, e4, dv4) {
+            if (t4 === 'mdhd') scale = dv4.getUint32(b4 + (init[b4] === 1 ? 20 : 12));
+          });
+        });
+        if (id !== null && scale) ts[id] = scale;
+      });
+    });
+    return ts;
+  }
+  // Reescreve o tfdt (início de cada fragmento) para manter o tempo contínuo
+  function fmp4Fixer(init) {
+    var scale = timescales(init), offset = {}, expected = {}, force = false;
+    function read(f) { return f.v1 ? f.dv.getUint32(f.pos + 4) * 4294967296 + f.dv.getUint32(f.pos + 8) : f.dv.getUint32(f.pos + 4); }
+    return {
+      // devolve os bytes do segmento (corrigidos se preciso) e se mudou algo
+      fix: function (u8, dur, disc) {
+        // sidx/styp: índice por segmento com os tempos antigos; num arquivo
+        // único são opcionais e ficariam errados depois da correção
+        var keep = [], dropped = false;
+        boxes(u8, 0, u8.length, function (t, o, b, e) {
+          if (t === 'sidx' || t === 'styp') dropped = true; else keep.push(u8.subarray(o, e));
+        });
+        if (dropped) u8 = concatU8(keep);
+        var tfdts = [];
+        boxes(u8, 0, u8.length, function (t, o, b, e) {
+          if (t !== 'moof') return;
+          boxes(u8, b, e, function (t2, o2, b2, e2) {
+            if (t2 !== 'traf') return;
+            var id = null;
+            boxes(u8, b2, e2, function (t3, o3, b3, e3, dv) {
+              if (t3 === 'tfhd') id = dv.getUint32(b3 + 4);
+              if (t3 === 'tfdt' && id !== null) tfdts.push({ id: id, pos: b3, v1: u8[b3] === 1, dv: dv });
+            });
+          });
+        });
+        var seen = {}, changed = false;
+        tfdts.forEach(function (f) {
+          var sc = scale[f.id] || 90000, val = read(f);
+          if (!seen[f.id]) {
+            seen[f.id] = 1;
+            var at = val / sc + (offset[f.id] || 0);
+            if (expected[f.id] !== undefined && (force || disc || Math.abs(at - expected[f.id]) > 5)) offset[f.id] = expected[f.id] - val / sc;
+            expected[f.id] = val / sc + (offset[f.id] || 0) + dur;
+          }
+          if (offset[f.id]) {
+            var nv = Math.max(0, Math.round(val + offset[f.id] * sc));
+            if (f.v1) { f.dv.setUint32(f.pos + 4, Math.floor(nv / 4294967296)); f.dv.setUint32(f.pos + 8, nv % 4294967296); }
+            else f.dv.setUint32(f.pos + 4, nv % 4294967296);
+            changed = true;
+          }
+        });
+        force = false;
+        return { data: u8, changed: changed || dropped };
+      },
+      skip: function () { force = true; },
+      // fim do vídeo em segundos (maior fim entre as trilhas)
+      end: function () {
+        var m = 0;
+        Object.keys(expected).forEach(function (k) { if (expected[k] > m) m = expected[k]; });
+        return m;
+      }
+    };
+  }
+
+  /* Grava a duração real no cabeçalho (mvhd/tkhd/mdhd). O conversor deixava
+     0xFFFFFFFF ("desconhecida"), que o iPhone mostrava como ~13 horas. */
+  function setInitDuration(init, seconds) {
+    if (!init || !(seconds > 0)) return init;
+    var u8 = new Uint8Array(init), movieScale = 1000;
+    function put(dv, pos, v1, val) {
+      val = Math.round(val);
+      if (v1) { dv.setUint32(pos, Math.floor(val / 4294967296)); dv.setUint32(pos + 4, val % 4294967296); }
+      else dv.setUint32(pos, Math.min(val, 4294967295));
+    }
+    boxes(u8, 0, u8.length, function (t, o, b, e) {
+      if (t !== 'moov') return;
+      boxes(u8, b, e, function (t2, o2, b2, e2, dv) {
+        if (t2 === 'mvhd') {
+          var v1 = u8[b2] === 1;
+          movieScale = dv.getUint32(b2 + (v1 ? 20 : 12)) || 1000;
+          put(dv, b2 + (v1 ? 24 : 16), v1, seconds * movieScale);
+        }
+        if (t2 !== 'trak') return;
+        boxes(u8, b2, e2, function (t3, o3, b3, e3, dv3) {
+          if (t3 === 'tkhd') { var w1 = u8[b3] === 1; put(dv3, b3 + (w1 ? 28 : 20), w1, seconds * movieScale); }
+          if (t3 === 'mdia') boxes(u8, b3, e3, function (t4, o4, b4, e4, dv4) {
+            if (t4 !== 'mdhd') return;
+            var x1 = u8[b4] === 1, sc = dv4.getUint32(b4 + (x1 ? 20 : 12)) || 90000;
+            put(dv4, b4 + (x1 ? 24 : 16), x1, seconds * sc);
+          });
+        });
+      });
+    });
+    return u8;
+  }
+
   var job0 = null; // download em andamento (para mensagens do conversor)
 
   async function downloadHls(item, job) {
@@ -495,61 +678,103 @@
     for (var i = 0; i < segs.length; i++) if (!have[i]) todo.push(i);
     var got = segs.length - todo.length;
     if (got) job.status('Retomando: ' + got + ' de ' + segs.length + ' partes já baixadas.');
-    var next = 0;
+    // Como num torrent: se uma parte falha, as outras seguem; as que
+    // falharam são tentadas de novo na próxima rodada.
+    var next = 0, failed = 0, lastErr = null;
     async function worker() {
       while (next < todo.length && !job.signal.aborted) {
-        var k = todo[next++];
-        var b = await fetchBytes(segs[k].url, job.signal);
-        await S.put(id, k, new Blob([b]));
+        var k = todo[next++], b;
+        try {
+          b = await fetchBytes(segs[k].url, job.signal);
+          await S.put(id, k, new Blob([b]));
+        } catch (e) {
+          if (job.signal.aborted) return;
+          failed++; lastErr = e;
+          continue;
+        }
         got++; meta.bytes += b.length; job.saved = true;
         meta.have = got;
         await S.putJob(meta);
-        job.progress(got / segs.length, got + '/' + segs.length + ' partes · ' + fmtBytes(meta.bytes) + note);
+        job.progress(got / segs.length, got + '/' + segs.length + ' partes · ' + fmtBytes(meta.bytes) +
+          (failed ? ' · ' + failed + ' com erro (tento de novo no fim)' : '') + note);
       }
     }
     await Promise.all([worker(), worker(), worker(), worker()]);
     if (job.signal.aborted) throw new DOMException('Pausado', 'AbortError');
-    meta.have = got; meta.complete = true;
+    meta.have = got;
     await S.putJob(meta);
-    return assembleHls(id, segs.length, fmp4, job);
+    if (failed) {
+      var err = new Error(failed + (failed === 1 ? ' parte não baixou' : ' partes não baixaram') +
+        ' (' + ((lastErr && lastErr.message) || 'erro de rede') + ').');
+      err.missing = failed;
+      err.hls = { id: id, segs: segs, fmp4: fmp4 };
+      throw err;
+    }
+    meta.complete = true;
+    await S.putJob(meta);
+    return assembleHls(id, segs, fmp4, job, false);
   }
 
-  /* Junta as partes guardadas. Segmentos .ts são convertidos um a um,
-     lendo do armazenamento, para não precisar de tudo na memória. */
-  async function assembleHls(id, count, fmp4, job) {
+  /* Junta as partes guardadas, lendo uma por vez do armazenamento.
+     Corrige o tempo nas emendas (ver tsConverter/fmp4Fixer). Com skipMissing,
+     pula as partes que não baixaram. */
+  async function assembleHls(id, segs, fmp4, job, skipMissing) {
     job.status('Montando arquivo…');
     var name = ((await S.jobs()).filter(function (x) { return x.id === id; })[0] || {}).name || baseName();
-    var i, parts = [];
-    if (fmp4) {
-      var init = await S.get(id, -1);
-      if (init) parts.push(init);
-      for (i = 0; i < count; i++) parts.push(await S.get(id, i));
-      return { blob: new Blob(parts, { type: 'video/mp4' }), name: name + '.mp4', id: id };
+    var count = segs.length, i, b, missing = 0;
+    async function piece(k) {
+      var x = await S.get(id, k);
+      if (!x) {
+        if (!skipMissing) throw new Error('Falta a parte ' + (k + 1) + ' de ' + count + '.');
+        missing++;
+      }
+      return x;
     }
-    var muxed = new Collector(), muxInit = null;
-    var mux = await newMux(function (sg) { if (!muxInit) muxInit = sg.initSegment; muxed.push(new Uint8Array(sg.data)); });
-    if (mux) {
+    function done(blob, ext) {
+      return { blob: blob, name: name + '.' + ext, id: id, missing: missing };
+    }
+    if (fmp4) {
+      var initB = await S.get(id, -1), init = initB ? await blobBytes(initB) : null;
+      var fx = fmp4Fixer(init), parts = [];
       for (i = 0; i < count; i++) {
-        mux.push(await blobBytes(await S.get(id, i)));
-        mux.flush();
+        b = await piece(i);
+        if (!b) { fx.skip(); continue; }
+        var u8 = await blobBytes(b);
+        // sem mudança, usa a parte guardada (fica no disco, não na memória)
+        var r = fx.fix(u8, segs[i].dur, segs[i].disc);
+        parts.push(r.changed ? new Blob([r.data]) : b);
+        if (i % 20 === 0) job.progress((i + 1) / count, 'Montando… ' + (i + 1) + '/' + count);
+      }
+      if (init) parts.unshift(setInitDuration(init, fx.end()));
+      return done(new Blob(parts, { type: 'video/mp4' }), 'mp4');
+    }
+    var conv = await tsConverter();
+    if (conv) {
+      for (i = 0; i < count; i++) {
+        b = await piece(i);
+        if (!b) { conv.skip(); continue; }
+        conv.push(await blobBytes(b), segs[i].dur, segs[i].disc);
         job.progress((i + 1) / count, 'Convertendo para MP4… ' + (i + 1) + '/' + count);
       }
-      if (!muxInit || !muxed.count) throw fatal('Falha ao converter para MP4');
-      return { blob: muxed.blob(muxInit, 'video/mp4'), name: name + '.mp4', id: id };
+      var mp4 = conv.blob();
+      if (!mp4) throw fatal('Falha ao converter para MP4');
+      return done(mp4, 'mp4');
     }
-    for (i = 0; i < count; i++) parts.push(await S.get(id, i));
-    return { blob: new Blob(parts, { type: 'video/mp2t' }), name: name + '.ts', id: id };
+    var raw = [];
+    for (i = 0; i < count; i++) { b = await piece(i); if (b) raw.push(b); }
+    return done(new Blob(raw, { type: 'video/mp2t' }), 'ts');
   }
 
   /* Ao vivo: grava até o usuário parar (não dá para retomar uma transmissão) */
   async function downloadLive(pl, url, fmp4, job, note) {
     var init = pl.map ? await fetchBytes(pl.map, job.signal) : null;
-    var muxed = new Collector(), muxInit = null, raw = new Collector();
-    var mux = fmp4 ? null : await newMux(function (sg) { if (!muxInit) muxInit = sg.initSegment; muxed.push(new Uint8Array(sg.data)); });
+    var raw = new Collector();
+    var feed = fmp4 ? null : await tsConverter(), fx = fmp4 ? fmp4Fixer(init) : null;
     var bytes = 0, done = 0;
-    function store(buf) {
+    function store(buf, seg) {
       bytes += buf.length;
-      if (mux) { mux.push(buf); mux.flush(); } else raw.push(buf);
+      if (feed) feed.push(buf, seg.dur, seg.disc);
+      else raw.push(fx ? fx.fix(buf, seg.dur, seg.disc).data : buf);
     }
     var last = -1, startedAt = Date.now(), firstRound = true;
     job.live(true);
@@ -558,7 +783,8 @@
       if (firstRound && fresh.length > 3) fresh = fresh.slice(-3); // começa perto do "agora"
       firstRound = false;
       for (var k = 0; k < fresh.length && !job.signal.aborted && !job.stopped; k++) {
-        try { store(await fetchBytes(fresh[k].url, job.signal)); done++; } catch (e) { if (job.signal.aborted) break; }
+        try { store(await fetchBytes(fresh[k].url, job.signal), fresh[k]); done++; }
+        catch (e) { if (job.signal.aborted) break; if (feed) feed.skip(); else if (fx) fx.skip(); }
         last = fresh[k].seq;
         var secs = Math.round((Date.now() - startedAt) / 1000);
         job.progress(-1, 'Gravando ' + Math.floor(secs / 60) + ':' + ('0' + secs % 60).slice(-2) + ' · ' + fmtBytes(bytes) + note);
@@ -570,9 +796,12 @@
     if (job.signal.aborted && !job.stopped) throw new DOMException('Cancelado', 'AbortError');
     if (!done) throw fatal('Nada gravado');
     job.status('Montando arquivo…');
-    if (fmp4) return { blob: raw.blob(init, 'video/mp4'), name: baseName() + '.mp4' };
-    if (mux && muxInit && muxed.count) return { blob: muxed.blob(muxInit, 'video/mp4'), name: baseName() + '.mp4' };
-    if (mux) throw fatal('Falha ao converter para MP4');
+    if (fmp4) return { blob: raw.blob(setInitDuration(init, fx.end()), 'video/mp4'), name: baseName() + '.mp4' };
+    if (feed) {
+      var mp4 = feed.blob();
+      if (!mp4) throw fatal('Falha ao converter para MP4');
+      return { blob: mp4, name: baseName() + '.mp4' };
+    }
     return { blob: raw.blob(null, 'video/mp2t'), name: baseName() + '.ts' };
   }
 
@@ -894,7 +1123,7 @@
             if (f >= 0) job.frac = f;
             bar.style.display = 'block';
             bar.classList.toggle('ind', f < 0);
-            bar.firstChild.style.width = f < 0 ? '' : Math.round(f * 100) + '%';
+            bar.firstChild.style.width = f < 0 ? '' : Math.floor(f * 100) + '%';
             if (t) { st.className = 's'; st.textContent = t; }
           },
           live: function () { job.isLive = true; stop.textContent = 'Parar e salvar'; stop.className = ''; }
@@ -916,7 +1145,9 @@
             var msg = (e && e.message) || '';
             // Erro de rede no meio: tenta continuar sozinho (3 vezes).
             // Sem nada baixado, um TypeError costuma ser bloqueio do site (CORS).
-            var retry = !e.fatal && attempt < 3 && !/HTTP 4\d\d/.test(msg) && (job.saved || !(e instanceof TypeError));
+            // Com algo já baixado, tenta de novo até com erro HTTP: a playlist é
+            // lida outra vez e links expirados costumam vir renovados.
+            var retry = !e.fatal && attempt < 3 && (job.saved || (!(e instanceof TypeError) && !/HTTP 4\d\d/.test(msg)));
             if (!retry) { err = e; break; }
             for (var w = [3, 6, 12][attempt]; w > 0 && !ctrl.signal.aborted; w--) {
               st.className = 's'; st.textContent = 'A conexão falhou. Continuando em ' + w + ' s… (' + Math.floor(job.frac * 100) + '% já guardado)';
@@ -951,6 +1182,29 @@
           (S.persistent() ? ', mesmo depois de recarregar a página.' : '.');
         else bar.style.display = 'none';
         st.textContent = m;
+        // Poucas partes que não baixam de jeito nenhum: dá para salvar sem elas
+        var h = err && err.hls;
+        if (h && err.missing <= Math.max(3, Math.ceil(h.segs.length * 0.02))) {
+          var skipBtn = el('button', 'g', 'Salvar sem ' + (err.missing === 1 ? 'a parte que falhou' : 'as ' + err.missing + ' partes que falharam'));
+          saveRow.textContent = ''; saveRow.appendChild(skipBtn);
+          saveRow.hidden = false; saveRow.style.display = '';
+          st.textContent += ' Ou salve sem ' + (err.missing === 1 ? 'ela' : 'elas') + ': o vídeo pula esse trecho.';
+          skipBtn.onclick = async function () {
+            skipBtn.disabled = true; go.disabled = true; discard.style.display = 'none';
+            try {
+              var out2 = await assembleHls(h.id, h.segs, h.fmp4, job, true);
+              finishedHere[h.id] = 1;
+              item.partial = null;
+              idle(null);
+              job.progress(1);
+              offerSave(out2);
+              st.textContent = st.textContent.replace('Pronto: ', 'Pronto (sem ' + out2.missing + ' de ' + h.segs.length + ' partes): ');
+            } catch (e2) {
+              st.className = 's e'; st.textContent = (e2 && e2.message) || String(e2);
+              skipBtn.disabled = false; go.disabled = false;
+            } finally { unmark(); }
+          };
+        }
       };
     });
   }
