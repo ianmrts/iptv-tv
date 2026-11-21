@@ -214,6 +214,11 @@
         if (d) { try { out = out.concat(await rq(d.transaction('chunks').objectStore('chunks').getAllKeys(IDBKeyRange.bound(pre, id + '\u0002')))); } catch (e) {} }
         return out.map(function (k) { k = k.slice(pre.length); return k === 'init' ? -1 : parseInt(k, 10); });
       },
+      delChunk: async function (id, i) {
+        delete memChunks[ck(id, i)];
+        var d = await open();
+        if (d) { try { var t = d.transaction('chunks', 'readwrite'); t.objectStore('chunks').delete(ck(id, i)); await done(t); } catch (e) {} }
+      },
       del: async function (id) {
         var pre = id + '\u0001';
         delete memJobs[id];
@@ -230,6 +235,12 @@
       }
     };
   })();
+
+  // Arquivo montado e entregue: as partes podem ser apagadas na próxima vez
+  async function markDone(id) {
+    var m = (await S.jobs()).filter(function (x) { return x.id === id; })[0];
+    if (m) { m.done = true; await S.putJob(m); }
+  }
 
   function jobId(url, choice) { return url + '|' + (choice || ''); }
   function fatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
@@ -266,8 +277,8 @@
     return (await fetchRetry(url, { signal: signal })).text();
   }
 
-  async function fetchBytes(url, signal) {
-    return new Uint8Array(await (await fetchRetry(url, { signal: signal })).arrayBuffer());
+  async function fetchBytes(url, signal, tries) {
+    return new Uint8Array(await (await fetchRetry(url, { signal: signal }, tries)).arrayBuffer());
   }
 
   var muxPromise = null;
@@ -305,8 +316,15 @@
   async function downloadFile(item, job) {
     var id = jobId(item.url);
     var meta = (await S.jobs()).filter(function (m) { return m.id === id; })[0] ||
-      { id: id, kind: 'file', url: item.url, name: baseName(), t: Date.now(), n: 0, saved: 0, total: 0 };
-    if (meta.complete) { meta.n = 0; meta.saved = 0; meta.complete = false; await S.del(id); }
+      { id: id, v: 2, kind: 'file', url: item.url, name: baseName(), t: Date.now(), n: 0, saved: 0, total: 0 };
+    if (meta.done) { await S.del(id); meta = { id: id, v: 2, kind: 'file', url: item.url, name: baseName(), t: Date.now(), n: 0, saved: 0, total: 0 }; }
+    meta.v = 2;
+    if (meta.complete) {
+      // já baixou tudo antes (a montagem falhou): só monta de novo
+      var have0 = await S.keys(id);
+      if (have0.length >= meta.n) return assembleFile(meta, item);
+      await S.del(id); meta.n = 0; meta.saved = 0; meta.complete = false;
+    }
     job.status(meta.saved ? 'Retomando de ' + fmtBytes(meta.saved) + '…' : 'Conectando…');
     var opts = { signal: job.signal };
     if (meta.saved) opts.headers = { Range: 'bytes=' + meta.saved + '-' };
@@ -363,10 +381,22 @@
     meta.complete = true;
     await S.putJob(meta);
     job.status('Montando arquivo…');
+    return assembleFile(meta, item);
+  }
+
+  async function assembleFile(meta, item) {
     var parts = [];
-    for (var i = 0; i < meta.n; i++) parts.push(await S.get(id, i));
-    var blob = new Blob(parts, { type: type || 'video/mp4' });
-    return { blob: blob, name: meta.name + '.' + extOf(item.url, type), id: id };
+    for (var i = 0; i < meta.n; i++) {
+      var p = await S.get(meta.id, i);
+      if (!p) {
+        // parte sumiu: no arquivo direto não dá para baixar só ela; recomeça
+        await S.del(meta.id);
+        throw new Error('Uma parte guardada se perdeu; baixando de novo.');
+      }
+      parts.push(p);
+    }
+    var type = meta.type || 'video/mp4';
+    return { blob: new Blob(parts, { type: type }), name: meta.name + '.' + extOf(item.url, type), id: meta.id };
   }
 
   /* ---------- HLS ---------- */
@@ -442,6 +472,9 @@
     var h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, x = ('0' + sec % 60).slice(-2);
     return h ? h + ':' + ('0' + m).slice(-2) + ':' + x : m + ':' + x;
   }
+
+  // Identifica a qualidade mesmo se o link dela mudar (tokens que expiram)
+  function variantKey(v) { return (v.res || '') + '|' + (v.bw || 0); }
 
   function variantLabel(v) {
     var q = qualityName(v.h) || 'Qualidade';
@@ -649,8 +682,10 @@
     if (/#EXT-X-STREAM-INF/.test(text)) {
       var m = parseMaster(text, url);
       if (!m.variants.length) throw fatal('Playlist sem variantes de vídeo');
-      var v = m.variants.filter(function (x) { return x.url === item.choice; })[0] || m.variants[0];
+      var v = m.variants.filter(function (x) { return x.url === item.choice; })[0] ||
+        m.variants.filter(function (x) { return item.choiceKey && variantKey(x) === item.choiceKey; })[0] || m.variants[0];
       item.choice = v.url;
+      item.choiceKey = variantKey(v);
       if (m.audioSep) note = ' (áudio vem separado neste site; o vídeo pode ficar sem som)';
       url = v.url;
       job.status('Qualidade: ' + variantLabel(v) + note);
@@ -664,12 +699,19 @@
     if (!pl.ended) return downloadLive(pl, url, fmp4, job, note);
 
     /* VOD: cada parte vai para o armazenamento; ao retomar, baixa só as que faltam */
-    var id = jobId(item.url, item.choice);
     var segs = pl.segments;
-    var meta = (await S.jobs()).filter(function (x) { return x.id === id; })[0];
-    if (meta && (meta.count !== segs.length || meta.complete)) { await S.del(id); meta = null; }
-    if (!meta) meta = { id: id, kind: 'hls', url: item.url, choice: item.choice || '', name: baseName(), t: Date.now(), count: segs.length, have: 0, bytes: 0 };
-    meta.fmp4 = fmp4;
+    var all = await S.jobs();
+    var meta = all.filter(function (x) { return x.id === jobId(item.url, item.choice) && !x.done; })[0] ||
+      // mesmo vídeo e mesma qualidade, mas o link da qualidade mudou
+      all.filter(function (x) { return x.kind === 'hls' && x.url === item.url && !x.done && item.choiceKey && x.key === item.choiceKey; })[0];
+    if (meta && meta.count !== segs.length) {
+      // a playlist mudou (outro número de partes): as partes antigas não servem
+      await S.del(meta.id); meta = null;
+      job.status('A playlist mudou desde a última vez; começando de novo.');
+    }
+    if (!meta) meta = { id: jobId(item.url, item.choice), v: 2, kind: 'hls', url: item.url, choice: item.choice || '', key: item.choiceKey || '', name: baseName(), t: Date.now(), count: segs.length, have: 0, bytes: 0 };
+    var id = meta.id;
+    meta.fmp4 = fmp4; meta.v = 2;
     await S.putJob(meta);
     var have = {};
     (await S.keys(id)).forEach(function (i) { have[i] = 1; });
@@ -677,15 +719,60 @@
     var todo = [];
     for (var i = 0; i < segs.length; i++) if (!have[i]) todo.push(i);
     var got = segs.length - todo.length;
-    if (got) job.status('Retomando: ' + got + ' de ' + segs.length + ' partes já baixadas.');
-    // Como num torrent: se uma parte falha, as outras seguem; as que
-    // falharam são tentadas de novo na próxima rodada.
+    if (got && todo.length) job.status('Retomando: ' + got + ' de ' + segs.length + ' partes já baixadas.');
+
+    // Relê a playlist para pegar links novos (quando os antigos expiram).
+    // Uma releitura por vez, no máximo a cada 5 s.
+    var refreshing = null, lastRefresh = 0;
+    function refresh() {
+      if (refreshing) return refreshing;
+      if (Date.now() - lastRefresh < 5000) return Promise.resolve();
+      refreshing = (async function () {
+        try {
+          var t = await fetchText(item.url, job.signal), mu = url;
+          if (/#EXT-X-STREAM-INF/.test(t)) {
+            var mm = parseMaster(t, item.url);
+            var vv = mm.variants.filter(function (x) { return variantKey(x) === item.choiceKey; })[0];
+            if (!vv) return;
+            mu = vv.url;
+            t = await fetchText(mu, job.signal);
+          }
+          var np = parseMedia(t, mu);
+          if (np.segments.length === segs.length) np.segments.forEach(function (sg, k) { segs[k].url = sg.url; });
+        } catch (e) {} finally { lastRefresh = Date.now(); refreshing = null; }
+      })();
+      return refreshing;
+    }
+
+    // Baixa uma parte tentando de novo na hora (6 vezes). A partir da 3ª
+    // falha, ou com erro HTTP 4xx (link expirado), relê a playlist antes.
+    var retrying = {};
+    function show() {
+      var r = Object.keys(retrying);
+      job.progress(got / segs.length, got + '/' + segs.length + ' partes · ' + fmtBytes(meta.bytes) +
+        (r.length ? ' · tentando de novo a parte ' + r.map(function (k) { return +k + 1; }).join(', ') : '') + note);
+    }
+    async function getSeg(k) {
+      for (var t = 0; ; t++) {
+        try {
+          var b = await fetchBytes(segs[k].url, job.signal, 1);
+          delete retrying[k];
+          return b;
+        } catch (e) {
+          if (job.signal.aborted || t >= 5) { delete retrying[k]; throw e; }
+          retrying[k] = 1; show();
+          if (t >= 2 || /HTTP 4\d\d/.test(e.message || '')) await refresh();
+          await sleep(Math.min(4000, 600 * (t + 1)));
+        }
+      }
+    }
+
     var next = 0, failed = 0, lastErr = null;
     async function worker() {
       while (next < todo.length && !job.signal.aborted) {
         var k = todo[next++], b;
         try {
-          b = await fetchBytes(segs[k].url, job.signal);
+          b = await getSeg(k);
           await S.put(id, k, new Blob([b]));
         } catch (e) {
           if (job.signal.aborted) return;
@@ -695,8 +782,7 @@
         got++; meta.bytes += b.length; job.saved = true;
         meta.have = got;
         await S.putJob(meta);
-        job.progress(got / segs.length, got + '/' + segs.length + ' partes · ' + fmtBytes(meta.bytes) +
-          (failed ? ' · ' + failed + ' com erro (tento de novo no fim)' : '') + note);
+        show();
       }
     }
     await Promise.all([worker(), worker(), worker(), worker()]);
@@ -705,11 +791,13 @@
     await S.putJob(meta);
     if (failed) {
       var err = new Error(failed + (failed === 1 ? ' parte não baixou' : ' partes não baixaram') +
-        ' (' + ((lastErr && lastErr.message) || 'erro de rede') + ').');
+        ' mesmo tentando de novo (' + ((lastErr && lastErr.message) || 'erro de rede') + ').');
       err.missing = failed;
       err.hls = { id: id, segs: segs, fmp4: fmp4 };
       throw err;
     }
+    // "complete" = todas as partes baixadas. Não apaga nada: se a montagem
+    // falhar, a próxima tentativa só monta de novo, sem baixar.
     meta.complete = true;
     await S.putJob(meta);
     return assembleHls(id, segs, fmp4, job, false);
@@ -722,13 +810,23 @@
     job.status('Montando arquivo…');
     var name = ((await S.jobs()).filter(function (x) { return x.id === id; })[0] || {}).name || baseName();
     var count = segs.length, i, b, missing = 0;
+    var bad = [];
+    // Lê uma parte guardada. Se não existir ou não der para ler, anota para
+    // baixar de novo só ela (ou pula, com skipMissing).
     async function piece(k) {
-      var x = await S.get(id, k);
-      if (!x) {
-        if (!skipMissing) throw new Error('Falta a parte ' + (k + 1) + ' de ' + count + '.');
-        missing++;
-      }
-      return x;
+      var x = null, u8 = null;
+      try { x = await S.get(id, k); if (x) u8 = await blobBytes(x); } catch (e) { x = null; }
+      if (!x || !u8) { if (skipMissing) missing++; else bad.push(k); return null; }
+      return { blob: x, u8: u8 };
+    }
+    async function redo() {
+      for (var j = 0; j < bad.length; j++) await S.delChunk(id, bad[j]);
+      var m = (await S.jobs()).filter(function (x) { return x.id === id; })[0];
+      if (m) { m.complete = false; m.have = Math.max(0, (m.have || count) - bad.length); await S.putJob(m); }
+      var e = new Error(bad.length + (bad.length === 1 ? ' parte guardada estava ilegível' : ' partes guardadas estavam ilegíveis') +
+        '; baixando só ' + (bad.length === 1 ? 'ela' : 'elas') + ' de novo.');
+      e.redo = true;
+      return e;
     }
     function done(blob, ext) {
       return { blob: blob, name: name + '.' + ext, id: id, missing: missing };
@@ -739,12 +837,12 @@
       for (i = 0; i < count; i++) {
         b = await piece(i);
         if (!b) { fx.skip(); continue; }
-        var u8 = await blobBytes(b);
         // sem mudança, usa a parte guardada (fica no disco, não na memória)
-        var r = fx.fix(u8, segs[i].dur, segs[i].disc);
-        parts.push(r.changed ? new Blob([r.data]) : b);
+        var r = fx.fix(b.u8, segs[i].dur, segs[i].disc);
+        parts.push(r.changed ? new Blob([r.data]) : b.blob);
         if (i % 20 === 0) job.progress((i + 1) / count, 'Montando… ' + (i + 1) + '/' + count);
       }
+      if (bad.length) throw await redo();
       if (init) parts.unshift(setInitDuration(init, fx.end()));
       return done(new Blob(parts, { type: 'video/mp4' }), 'mp4');
     }
@@ -753,15 +851,18 @@
       for (i = 0; i < count; i++) {
         b = await piece(i);
         if (!b) { conv.skip(); continue; }
-        conv.push(await blobBytes(b), segs[i].dur, segs[i].disc);
+        if (bad.length) continue; // já vai ter que montar de novo; só confere as outras
+        conv.push(b.u8, segs[i].dur, segs[i].disc);
         job.progress((i + 1) / count, 'Convertendo para MP4… ' + (i + 1) + '/' + count);
       }
+      if (bad.length) throw await redo();
       var mp4 = conv.blob();
       if (!mp4) throw fatal('Falha ao converter para MP4');
       return done(mp4, 'mp4');
     }
     var raw = [];
-    for (i = 0; i < count; i++) { b = await piece(i); if (b) raw.push(b); }
+    for (i = 0; i < count; i++) { b = await piece(i); if (b) raw.push(b.blob); }
+    if (bad.length) throw await redo();
     return done(new Blob(raw, { type: 'video/mp2t' }), 'ts');
   }
 
@@ -883,7 +984,8 @@
     var partial = {};
     stored.forEach(function (m) {
       if (finishedHere[m.id]) return;
-      if (m.complete || Date.now() - m.t > 7 * 864e5) { S.del(m.id); return; }
+      // apaga os já salvos (e os de versões antigas que chegaram ao fim) e os muito antigos
+      if (m.done || (m.complete && !m.v) || Date.now() - m.t > 7 * 864e5) { S.del(m.id); return; }
       partial[m.url] = m;
     });
     Object.keys(partial).forEach(function (u) {
@@ -892,6 +994,7 @@
       if (!it) { it = { url: u, kind: m.kind, label: 'incompleto', poster: null }; res.items.unshift(it); }
       it.partial = m;
       it.choice = m.choice || it.choice;
+      it.choiceKey = m.key || it.choiceKey;
     });
     list.querySelectorAll('video').forEach(function (v) { v.removeAttribute('src'); v.load(); });
     list.textContent = '';
@@ -968,8 +1071,10 @@
               m.variants.forEach(function (v) { hide(v.url); });
               m.audio.forEach(hide);
               if (!m.variants.length) return;
-              var cur = m.variants.filter(function (v) { return v.url === item.choice; })[0] || m.variants[0];
+              var cur = m.variants.filter(function (v) { return v.url === item.choice; })[0] ||
+                m.variants.filter(function (v) { return item.choiceKey && variantKey(v) === item.choiceKey; })[0] || m.variants[0];
               item.choice = cur.url;
+              item.choiceKey = variantKey(cur);
               Object.assign(q, { h: cur.h, res: cur.res, bw: cur.bw });
               if (m.variants.length > 1) {
                 m.variants.forEach(function (v) {
@@ -979,11 +1084,12 @@
                 sel.hidden = false; sel.style.display = '';
                 sel.onchange = function () {
                   var v = m.variants[sel.selectedIndex];
-                  if (item.partial && item.partial.choice !== v.url) {
+                  if (item.partial && item.partial.choice !== v.url && item.partial.key !== variantKey(v)) {
                     st.className = 's'; st.textContent = 'O download incompleto é de outra qualidade; esta começa do zero.';
                     idle(null);
                   } else if (item.partial) idle(pctOf(item.partial));
                   item.choice = v.url;
+                  item.choiceKey = variantKey(v);
                   Object.assign(q, { h: v.h, res: v.res, bw: v.bw });
                   showInfo();
                 };
@@ -1037,6 +1143,7 @@
       list.appendChild(box);
 
       function pctOf(m) {
+        if (m.complete) return 100;
         var f = m.kind === 'hls' ? (m.count ? m.have / m.count : 0) : (m.total ? m.saved / m.total : 0);
         return Math.min(99, Math.floor(f * 100));
       }
@@ -1045,7 +1152,7 @@
         go.disabled = false;
         stop.style.display = 'none'; stop.disabled = false;
         if (pct != null) {
-          go.textContent = 'Continuar (' + pct + '%)';
+          go.textContent = pct >= 100 ? 'Montar o vídeo' : 'Continuar (' + pct + '%)';
           discard.style.display = '';
           bar.style.display = 'block'; bar.classList.remove('ind'); bar.firstChild.style.width = pct + '%';
         } else {
@@ -1056,8 +1163,9 @@
       if (item.partial) {
         idle(pctOf(item.partial));
         st.className = 's';
-        st.textContent = 'Download incompleto' + (item.partial.name ? ' ("' + item.partial.name + '")' : '') +
-          '. Toque em Continuar para baixar só o que falta.';
+        st.textContent = item.partial.complete
+          ? 'Todas as partes' + (item.partial.name ? ' de "' + item.partial.name + '"' : '') + ' já foram baixadas. Toque em "Montar o vídeo".'
+          : 'Download incompleto' + (item.partial.name ? ' ("' + item.partial.name + '")' : '') + '. Toque em Continuar para baixar só o que falta.';
       }
       discard.onclick = async function () {
         var ms = (await S.jobs()).filter(function (m) { return m.url === item.url && !finishedHere[m.id]; });
@@ -1147,10 +1255,11 @@
             // Sem nada baixado, um TypeError costuma ser bloqueio do site (CORS).
             // Com algo já baixado, tenta de novo até com erro HTTP: a playlist é
             // lida outra vez e links expirados costumam vir renovados.
-            var retry = !e.fatal && attempt < 3 && (job.saved || (!(e instanceof TypeError) && !/HTTP 4\d\d/.test(msg)));
+            var retry = !e.fatal && attempt < 4 && (job.saved || (!(e instanceof TypeError) && !/HTTP 4\d\d/.test(msg)));
             if (!retry) { err = e; break; }
-            for (var w = [3, 6, 12][attempt]; w > 0 && !ctrl.signal.aborted; w--) {
-              st.className = 's'; st.textContent = 'A conexão falhou. Continuando em ' + w + ' s… (' + Math.floor(job.frac * 100) + '% já guardado)';
+            for (var w = [1, 2, 5, 10][attempt]; w > 0 && !ctrl.signal.aborted; w--) {
+              st.className = 's'; st.textContent = (e.redo || e.missing ? e.message + ' ' : 'A conexão falhou. ') +
+                'Continuando em ' + w + ' s… (' + Math.floor(job.frac * 100) + '% já guardado)';
               await sleep(1000);
             }
             if (ctrl.signal.aborted) { paused = true; break; }
@@ -1159,7 +1268,7 @@
         unmark();
         var pct = job.saved && !job.isLive ? Math.min(99, Math.floor(job.frac * 100)) : null;
         if (out) {
-          if (out.id) finishedHere[out.id] = 1;
+          if (out.id) { finishedHere[out.id] = 1; markDone(out.id); }
           item.partial = null;
           idle(null);
           job.progress(1);
@@ -1193,7 +1302,7 @@
             skipBtn.disabled = true; go.disabled = true; discard.style.display = 'none';
             try {
               var out2 = await assembleHls(h.id, h.segs, h.fmp4, job, true);
-              finishedHere[h.id] = 1;
+              finishedHere[h.id] = 1; markDone(h.id);
               item.partial = null;
               idle(null);
               job.progress(1);
