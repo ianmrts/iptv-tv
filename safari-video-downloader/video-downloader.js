@@ -813,6 +813,7 @@
       // A playlist não abre (link expirado, sem rede), mas todas as partes
       // já estão guardadas? Monta assim mesmo; as durações vêm das partes.
       if (job.signal.aborted) throw e;
+      var best = null;
       for (var si = 0; si < stored.length; si++) {
         var x = stored[si], keys = await S.keys(x.id), n = 0;
         keys.forEach(function (k) { if (k >= 0 && k < x.count) n++; });
@@ -821,6 +822,14 @@
           item.codec = x.codec || item.codec;
           return assembleHls(x.id, segsOf(x), x.fmp4, job, false);
         }
+        if (x.count && n && (!best || n > best.n)) best = { x: x, n: n, init: !x.fmp4 || keys.indexOf(-1) >= 0 };
+      }
+      // Faltam partes e não dá para baixá-las agora: oferece salvar o que tem
+      if (best && best.init) {
+        e.hls = { id: best.x.id, segs: segsOf(best.x), fmp4: best.x.fmp4 };
+        e.missing = best.x.count - best.n;
+        e.offline = true;
+        item.codec = best.x.codec || item.codec;
       }
       throw e;
     }
@@ -1481,11 +1490,15 @@
         st.textContent = m;
         // Poucas partes que não baixam de jeito nenhum: dá para salvar sem elas
         var h = err && err.hls;
-        if (h && err.missing <= Math.max(3, Math.ceil(h.segs.length * 0.02))) {
-          var skipBtn = el('button', 'g', 'Salvar sem ' + (err.missing === 1 ? 'a parte que falhou' : 'as ' + err.missing + ' partes que falharam'));
+        if (h && (err.offline || err.missing <= Math.max(3, Math.ceil(h.segs.length * 0.02)))) {
+          var skipBtn = el('button', err.offline ? '' : 'g', err.offline
+            ? 'Salvar o que já foi baixado (' + (h.segs.length - err.missing) + ' de ' + h.segs.length + ' partes)'
+            : 'Salvar sem ' + (err.missing === 1 ? 'a parte que falhou' : 'as ' + err.missing + ' partes que falharam'));
+          if (err.offline) st.textContent = 'A playlist não abriu (' + ((err && err.message) || 'erro') + ') e faltam ' + err.missing + ' de ' + h.segs.length +
+            ' partes. Recarregue a página e toque em Continuar para baixá-las, ou salve o que já tem:';
           saveRow.textContent = ''; saveRow.appendChild(skipBtn);
           saveRow.hidden = false; saveRow.style.display = '';
-          st.textContent += ' Ou salve sem ' + (err.missing === 1 ? 'ela' : 'elas') + ': o vídeo pula esse trecho.';
+          if (!err.offline) st.textContent += ' Ou salve sem ' + (err.missing === 1 ? 'ela' : 'elas') + ': o vídeo pula esse trecho.';
           skipBtn.onclick = async function () {
             skipBtn.disabled = true; go.disabled = true; discard.style.display = 'none';
             try {
