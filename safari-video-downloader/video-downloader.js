@@ -274,6 +274,18 @@
     return /Load failed|NetworkError|Failed to fetch|network connection|internet|conex/i.test((e && e.message) || '');
   }
 
+  // Endereço sem a parte "?token=…": links com token mudam a cada visita,
+  // mas o caminho do vídeo é o mesmo
+  function pathKey(u) { try { var x = new URL(u); return x.origin + x.pathname; } catch (e) { return u; } }
+
+  // O download guardado é deste item? (mesmo link, ou adotado pelo caminho)
+  function sameItem(x, item) {
+    return x.kind === (item.kind || 'hls') && !x.done && (x.url === item.url || x.id === item.adoptId);
+  }
+  function sameQuality(x, item) {
+    return (x.choice || '') === (item.choice || '') || (item.choiceKey && x.key === item.choiceKey) || x.id === item.adoptId;
+  }
+
   function jobId(url, choice) { return url + '|' + (choice || ''); }
   function fatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
   async function blobBytes(b) { return new Uint8Array(await new Response(b).arrayBuffer()); }
@@ -346,11 +358,11 @@
   /* ---------- Download de arquivo direto ---------- */
 
   async function downloadFile(item, job) {
-    var id = jobId(item.url);
+    var id = item.adoptId || jobId(item.url);
     var meta = (await S.jobs()).filter(function (m) { return m.id === id; })[0] ||
       { id: id, v: 2, kind: 'file', url: item.url, name: baseName(), t: Date.now(), n: 0, saved: 0, total: 0 };
     if (meta.done) { await S.del(id); meta = { id: id, v: 2, kind: 'file', url: item.url, name: baseName(), t: Date.now(), n: 0, saved: 0, total: 0 }; }
-    meta.v = 2;
+    meta.v = 2; meta.url = item.url; meta.path = pathKey(item.url);
     if (meta.complete) {
       // já baixou tudo antes (a montagem falhou): só monta de novo
       var have0 = await S.keys(id);
@@ -507,6 +519,14 @@
   }
 
   // Identifica a qualidade mesmo se o link dela mudar (tokens que expiram)
+  // durações e descontinuidades guardadas; sem elas, 0 (vêm das partes)
+  function segsOf(m) {
+    if (m.segInfo) return m.segInfo.map(function (a) { return { dur: a[0], disc: !!a[1] }; });
+    var out = [];
+    for (var i = 0; i < m.count; i++) out.push({ dur: 0, disc: false });
+    return out;
+  }
+
   function variantKey(v) { return (v.res || '') + '|' + (v.bw || 0); }
 
   function variantLabel(v) {
@@ -580,7 +600,8 @@
           var cont = !disc && !force && pts !== null && prevPts !== null;
           if (cont) {
             var d = ((pts - prevPts) % PTS_WRAP + PTS_WRAP) % PTS_WRAP;
-            cont = Math.abs(d - prevDur * 90000) <= 5 * 90000;
+            // sem a duração da playlist (prevDur 0), aceita um passo de até 30 s
+            cont = prevDur ? Math.abs(d - prevDur * 90000) <= 5 * 90000 : d > 0 && d < 30 * 90000;
           }
           if (!cont) { reset = true; mux.setBaseMediaDecodeTime(0); }
         }
@@ -661,23 +682,52 @@
   }
 
   // Reescreve o tfdt (início de cada fragmento) para manter o tempo contínuo
+  // Duração padrão das amostras de cada trilha (trex, no init)
+  function trexDefaults(init) {
+    var d = {};
+    if (!init) return d;
+    boxes(init, 0, init.length, function (t, o, b, e) {
+      if (t !== 'moov') return;
+      boxes(init, b, e, function (t2, o2, b2, e2) {
+        if (t2 === 'mvex') boxes(init, b2, e2, function (t3, o3, b3, e3, dv) {
+          if (t3 === 'trex') d[dv.getUint32(b3 + 4)] = dv.getUint32(b3 + 12);
+        });
+      });
+    });
+    return d;
+  }
+
   function fmp4Fixer(init) {
-    var scale = timescales(init), offset = {}, expected = {}, force = false;
+    var scale = timescales(init), trex = trexDefaults(init), offset = {}, expected = {}, force = false;
     function read(f) { return f.v1 ? f.dv.getUint32(f.pos + 4) * 4294967296 + f.dv.getUint32(f.pos + 8) : f.dv.getUint32(f.pos + 4); }
     return {
       // Corrige no lugar os tfdt dos moof de um segmento. "list" é uma lista
       // de pedaços de bytes que contêm as caixas moof (o mdat não precisa).
       // Devolve true se mudou algo.
       fix: function (list, dur, disc) {
-        var tfdts = [];
+        var tfdts = [], segDur = {};
         list.forEach(function (u8) { boxes(u8, 0, u8.length, function (t, o, b, e) {
           if (t !== 'moof') return;
           boxes(u8, b, e, function (t2, o2, b2, e2) {
             if (t2 !== 'traf') return;
-            var id = null;
+            var id = null, defDur = 0;
             boxes(u8, b2, e2, function (t3, o3, b3, e3, dv) {
-              if (t3 === 'tfhd') id = dv.getUint32(b3 + 4);
+              var flags = (u8[b3 + 1] << 16) | (u8[b3 + 2] << 8) | u8[b3 + 3];
+              if (t3 === 'tfhd') {
+                id = dv.getUint32(b3 + 4);
+                // campos opcionais em ordem: base_data_offset(8), sample_description_index(4), default_sample_duration(4)
+                var q = b3 + 8 + (flags & 1 ? 8 : 0) + (flags & 2 ? 4 : 0);
+                defDur = flags & 8 ? dv.getUint32(q) : (trex[id] || 0);
+              }
               if (t3 === 'tfdt' && id !== null) tfdts.push({ id: id, pos: b3, v1: u8[b3] === 1, dv: dv });
+              if (t3 === 'trun' && id !== null) {
+                // soma a duração real das amostras (mais precisa que o EXTINF)
+                var n = dv.getUint32(b3 + 4), r = b3 + 8 + (flags & 1 ? 4 : 0) + (flags & 4 ? 4 : 0);
+                var step = ((flags & 0x100) ? 4 : 0) + ((flags & 0x200) ? 4 : 0) + ((flags & 0x400) ? 4 : 0) + ((flags & 0x800) ? 4 : 0), sum = 0;
+                if (flags & 0x100) { for (var k = 0; k < n && r + 4 <= e3; k++, r += step) sum += dv.getUint32(r); }
+                else sum = n * defDur;
+                segDur[id] = (segDur[id] || 0) + sum;
+              }
             });
           });
         }); });
@@ -688,7 +738,8 @@
             seen[f.id] = 1;
             var at = val / sc + (offset[f.id] || 0);
             if (expected[f.id] !== undefined && (force || disc || Math.abs(at - expected[f.id]) > 5)) offset[f.id] = expected[f.id] - val / sc;
-            expected[f.id] = val / sc + (offset[f.id] || 0) + dur;
+            // fim desta parte: duração real das amostras; sem ela, o EXTINF
+            expected[f.id] = val / sc + (offset[f.id] || 0) + (segDur[f.id] ? segDur[f.id] / sc : dur);
           }
           if (offset[f.id]) {
             var nv = Math.max(0, Math.round(val + offset[f.id] * sc));
@@ -748,17 +799,31 @@
     job0 = job;
     job.phase = 'download';
     // Já baixou tudo antes? Monta direto, sem depender da rede.
-    var ready = (await S.jobs()).filter(function (x) {
-      return x.kind === 'hls' && x.url === item.url && x.complete && !x.done && x.segInfo &&
-        ((x.choice || '') === (item.choice || '') || (item.choiceKey && x.key === item.choiceKey));
-    })[0];
+    var stored = (await S.jobs()).filter(function (x) { return sameItem(x, item) && sameQuality(x, item); });
+    var ready = stored.filter(function (x) { return x.complete && x.segInfo; })[0];
     if (ready) {
       item.codec = ready.codec || item.codec;
-      return assembleHls(ready.id, ready.segInfo.map(function (a) { return { dur: a[0], disc: !!a[1] }; }), ready.fmp4, job, false);
+      return assembleHls(ready.id, segsOf(ready), ready.fmp4, job, false);
     }
     job.status('Lendo playlist…');
-    var url = item.url;
-    var text = await fetchText(url, job.signal);
+    var url = item.url, text;
+    try {
+      text = await fetchText(url, job.signal);
+    } catch (e) {
+      // A playlist não abre (link expirado, sem rede), mas todas as partes
+      // já estão guardadas? Monta assim mesmo; as durações vêm das partes.
+      if (job.signal.aborted) throw e;
+      for (var si = 0; si < stored.length; si++) {
+        var x = stored[si], keys = await S.keys(x.id), n = 0;
+        keys.forEach(function (k) { if (k >= 0 && k < x.count) n++; });
+        if (x.count && n >= x.count && (!x.fmp4 || keys.indexOf(-1) >= 0)) {
+          job.status('A playlist não abriu, mas todas as partes estão guardadas: montando.');
+          item.codec = x.codec || item.codec;
+          return assembleHls(x.id, segsOf(x), x.fmp4, job, false);
+        }
+      }
+      throw e;
+    }
     if (!/^#EXTM3U/.test(text.trim())) throw fatal('Não é uma playlist HLS');
     var note = '';
     if (/#EXT-X-STREAM-INF/.test(text)) {
@@ -785,8 +850,8 @@
     var segs = pl.segments;
     var all = await S.jobs();
     var meta = all.filter(function (x) { return x.id === jobId(item.url, item.choice) && !x.done; })[0] ||
-      // mesmo vídeo e mesma qualidade, mas o link da qualidade mudou
-      all.filter(function (x) { return x.kind === 'hls' && x.url === item.url && !x.done && item.choiceKey && x.key === item.choiceKey; })[0];
+      // mesmo vídeo e mesma qualidade, mas o link mudou (token novo)
+      all.filter(function (x) { return x.kind === 'hls' && sameItem(x, item) && sameQuality(x, item); })[0];
     if (meta && meta.count !== segs.length) {
       // a playlist mudou (outro número de partes): as partes antigas não servem
       await S.del(meta.id); meta = null;
@@ -794,6 +859,7 @@
     }
     if (!meta) meta = { id: jobId(item.url, item.choice), v: 2, kind: 'hls', url: item.url, choice: item.choice || '', key: item.choiceKey || '', name: baseName(), t: Date.now(), count: segs.length, have: 0, bytes: 0 };
     var id = meta.id;
+    meta.url = item.url; meta.path = pathKey(item.url); // link atual (o token pode ter mudado)
     meta.fmp4 = fmp4; meta.v = 2; meta.codec = item.codec || '';
     // duração e descontinuidades de cada parte: permitem montar sem a rede
     meta.segInfo = segs.map(function (sg) { return [sg.dur, sg.disc ? 1 : 0]; });
@@ -1102,7 +1168,10 @@
     });
     Object.keys(partial).forEach(function (u) {
       var m = partial[u];
-      var it = res.items.filter(function (x) { return x.url === u; })[0];
+      var it = res.items.filter(function (x) { return x.url === u; })[0] ||
+        // mesmo vídeo com link novo (token diferente): continua o download guardado
+        res.items.filter(function (x) { return !x.partial && x.kind === m.kind && pathKey(x.url) === (m.path || pathKey(m.url)); })[0];
+      if (it && it.url !== u) it.adoptId = m.id;
       if (!it) { it = { url: u, kind: m.kind, label: 'incompleto', poster: null }; res.items.unshift(it); }
       it.partial = m;
       it.choice = m.choice || it.choice;
@@ -1280,7 +1349,7 @@
           : 'Download incompleto' + (item.partial.name ? ' ("' + item.partial.name + '")' : '') + '. Toque em Continuar para baixar só o que falta.';
       }
       discard.onclick = async function () {
-        var ms = (await S.jobs()).filter(function (m) { return m.url === item.url && !finishedHere[m.id]; });
+        var ms = (await S.jobs()).filter(function (m) { return (m.url === item.url || m.id === item.adoptId) && !finishedHere[m.id]; });
         for (var i = 0; i < ms.length; i++) await S.del(ms[i].id);
         item.partial = null;
         idle(null);
