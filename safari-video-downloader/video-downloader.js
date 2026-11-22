@@ -163,10 +163,15 @@
      memória da aba. Sem IndexedDB (ex.: bloqueado), guarda na memória e só
      retoma enquanto a página não recarregar. */
   var S = (function () {
-    var memJobs = {}, memChunks = {}, dbp = null, useDb = true;
-    function ck(id, i) { return id + '\u0001' + (i < 0 ? 'init' : ('00000' + i).slice(-6)); }
+    var memJobs = {}, memChunks = {}, dbp = null, broken = false, usedMem = false;
+    // chave de uma parte: número (parte do vídeo), -1 (init) ou texto (saída montada)
+    function ck(id, i) {
+      return id + '\u0001' + (typeof i === 'string' ? i : i < 0 ? 'init' : ('00000' + i).slice(-6));
+    }
     function open() {
+      if (broken) return Promise.resolve(null);
       if (!dbp) dbp = new Promise(function (res) {
+        var t = setTimeout(function () { res(null); }, 4000);
         try {
           var rq = indexedDB.open('__vdl', 1);
           rq.onupgradeneeded = function () {
@@ -174,64 +179,86 @@
             if (!d.objectStoreNames.contains('jobs')) d.createObjectStore('jobs', { keyPath: 'id' });
             if (!d.objectStoreNames.contains('chunks')) d.createObjectStore('chunks');
           };
-          rq.onsuccess = function () { res(rq.result); };
-          rq.onerror = rq.onblocked = function () { res(null); };
-        } catch (e) { res(null); }
-        setTimeout(function () { res(null); }, 4000);
-      });
+          rq.onsuccess = function () {
+            clearTimeout(t);
+            var d = rq.result;
+            d.onclose = function () { dbp = null; }; // o Safari fechou a conexão: reabre na próxima
+            res(d);
+          };
+          rq.onerror = rq.onblocked = function () { clearTimeout(t); res(null); };
+        } catch (e) { clearTimeout(t); res(null); }
+      }).then(function (d) { if (!d) { dbp = null; broken = true; } return d; });
       return dbp;
     }
     function rq(r) { return new Promise(function (res, rej) { r.onsuccess = function () { res(r.result); }; r.onerror = function () { rej(r.error); }; }); }
     function done(t) { return new Promise(function (res, rej) { t.oncomplete = res; t.onerror = t.onabort = function () { rej(t.error); }; }); }
-    async function db() { if (!useDb) return null; var d = await open(); if (!d) useDb = false; return d; }
+    /* Roda uma operação no IndexedDB. No iPhone a conexão às vezes cai
+       ("Connection to Indexed Database server lost"), por exemplo quando o
+       Safari reinicia um processo: reabre e tenta de novo, sem desistir. */
+    async function withDb(fn) {
+      for (var t = 0; t < 4; t++) {
+        var d = await open();
+        if (!d) return { ok: false };
+        try { return { ok: true, v: await fn(d) }; }
+        catch (e) {
+          if (dbp) { try { d.close(); } catch (x) {} dbp = null; }
+          await sleep(400 * (t + 1));
+        }
+      }
+      return { ok: false };
+    }
     return {
-      persistent: function () { return useDb; },
+      // true se tudo está no armazenamento (sobrevive a recarregar a página)
+      persistent: function () { return !broken && !usedMem; },
       putJob: async function (m) {
-        var d = await db();
-        if (d) { try { var t = d.transaction('jobs', 'readwrite'); t.objectStore('jobs').put(m); await done(t); return; } catch (e) { useDb = false; } }
-        memJobs[m.id] = JSON.parse(JSON.stringify(m));
+        var r = await withDb(async function (d) { var t = d.transaction('jobs', 'readwrite'); t.objectStore('jobs').put(m); await done(t); });
+        if (!r.ok) memJobs[m.id] = JSON.parse(JSON.stringify(m));
       },
       jobs: async function () {
         var out = Object.keys(memJobs).map(function (k) { return memJobs[k]; });
-        var d = await db();
-        if (d) { try { out = out.concat(await rq(d.transaction('jobs').objectStore('jobs').getAll())); } catch (e) {} }
+        var r = await withDb(function (d) { return rq(d.transaction('jobs').objectStore('jobs').getAll()); });
+        if (r.ok) r.v.forEach(function (m) { if (!memJobs[m.id]) out.push(m); });
         return out;
       },
       put: async function (id, i, blob) {
-        var d = await db();
-        if (d) { try { var t = d.transaction('chunks', 'readwrite'); t.objectStore('chunks').put(blob, ck(id, i)); await done(t); return; } catch (e) { useDb = false; } }
-        memChunks[ck(id, i)] = blob;
+        var r = await withDb(async function (d) { var t = d.transaction('chunks', 'readwrite'); t.objectStore('chunks').put(blob, ck(id, i)); await done(t); });
+        if (!r.ok) { memChunks[ck(id, i)] = blob; usedMem = true; }
       },
       get: async function (id, i) {
         var k = ck(id, i);
         if (memChunks[k]) return memChunks[k];
-        var d = await open();
-        return d ? rq(d.transaction('chunks').objectStore('chunks').get(k)) : null;
+        var r = await withDb(function (d) { return rq(d.transaction('chunks').objectStore('chunks').get(k)); });
+        if (!r.ok && !broken) throw new Error('Não deu para ler o armazenamento do Safari');
+        return r.ok ? r.v : null;
       },
       keys: async function (id) {
         var pre = id + '\u0001', out = Object.keys(memChunks).filter(function (k) { return k.indexOf(pre) === 0; });
-        var d = await open();
-        if (d) { try { out = out.concat(await rq(d.transaction('chunks').objectStore('chunks').getAllKeys(IDBKeyRange.bound(pre, id + '\u0002')))); } catch (e) {} }
-        return out.map(function (k) { k = k.slice(pre.length); return k === 'init' ? -1 : parseInt(k, 10); });
+        var r = await withDb(function (d) { return rq(d.transaction('chunks').objectStore('chunks').getAllKeys(IDBKeyRange.bound(pre, id + '\u0002'))); });
+        if (r.ok) out = out.concat(r.v);
+        var seen = {};
+        return out.map(function (k) { k = k.slice(pre.length); return k === 'init' ? -1 : /^\d+$/.test(k) ? parseInt(k, 10) : null; })
+          .filter(function (n) { if (n === null || seen[n]) return false; seen[n] = 1; return true; });
       },
       delChunk: async function (id, i) {
         delete memChunks[ck(id, i)];
-        var d = await open();
-        if (d) { try { var t = d.transaction('chunks', 'readwrite'); t.objectStore('chunks').delete(ck(id, i)); await done(t); } catch (e) {} }
+        await withDb(async function (d) { var t = d.transaction('chunks', 'readwrite'); t.objectStore('chunks').delete(ck(id, i)); await done(t); });
+      },
+      // apaga as partes de saída (texto) de uma montagem anterior
+      delOut: async function (id) {
+        var a = id + '\u0001o', b = id + '\u0001p';
+        Object.keys(memChunks).forEach(function (k) { if (k >= a && k < b) delete memChunks[k]; });
+        await withDb(async function (d) { var t = d.transaction('chunks', 'readwrite'); t.objectStore('chunks').delete(IDBKeyRange.bound(a, b, false, true)); await done(t); });
       },
       del: async function (id) {
         var pre = id + '\u0001';
         delete memJobs[id];
         Object.keys(memChunks).forEach(function (k) { if (k.indexOf(pre) === 0) delete memChunks[k]; });
-        var d = await open();
-        if (d) {
-          try {
-            var t = d.transaction(['jobs', 'chunks'], 'readwrite');
-            t.objectStore('jobs').delete(id);
-            t.objectStore('chunks').delete(IDBKeyRange.bound(pre, id + '\u0002'));
-            await done(t);
-          } catch (e) {}
-        }
+        await withDb(async function (d) {
+          var t = d.transaction(['jobs', 'chunks'], 'readwrite');
+          t.objectStore('jobs').delete(id);
+          t.objectStore('chunks').delete(IDBKeyRange.bound(pre, id + '\u0002'));
+          await done(t);
+        });
       }
     };
   })();
@@ -240,6 +267,11 @@
   async function markDone(id) {
     var m = (await S.jobs()).filter(function (x) { return x.id === id; })[0];
     if (m) { m.done = true; await S.putJob(m); }
+  }
+
+  // erro de rede de verdade (e não um erro qualquer do código)
+  function isNetErr(e) {
+    return /Load failed|NetworkError|Failed to fetch|network connection|internet|conex/i.test((e && e.message) || '');
   }
 
   function jobId(url, choice) { return url + '|' + (choice || ''); }
@@ -445,7 +477,8 @@
         var bw = parseInt(attr(l, 'AVERAGE-BANDWIDTH') || attr(l, 'BANDWIDTH'), 10) || 0;
         var codecs = attr(l, 'CODECS') || '';
         if (!h && codecs && !/avc|hvc|hev|vp0?9|av01|dvh/i.test(codecs)) continue; // só áudio
-        vars.push({ url: u, h: h, bw: bw, res: res });
+        var cn = /av01/i.test(codecs) ? 'AV1' : /hvc1|hev1|dvh/i.test(codecs) ? 'HEVC' : /avc/i.test(codecs) ? 'H.264' : /vp0?9/i.test(codecs) ? 'VP9' : '';
+        vars.push({ url: u, h: h, bw: bw, res: res, codec: cn });
       }
     }
     vars.sort(function (a, b) { return (b.h - a.h) || (b.bw - a.bw); });
@@ -478,7 +511,7 @@
 
   function variantLabel(v) {
     var q = qualityName(v.h) || 'Qualidade';
-    return q + (v.res ? ' (' + v.res + ')' : '') + (v.bw ? ' · ' + fmtRate(v.bw) : '');
+    return q + (v.res ? ' (' + v.res + ')' : '') + (v.bw ? ' · ' + fmtRate(v.bw) : '') + (v.codec ? ' · ' + v.codec : '');
   }
 
   /* ---------- Linha do tempo contínua ----------
@@ -519,16 +552,29 @@
      reinicia o relógio do conversor (senão ele descarta os quadros quando o
      relógio volta para trás) e depois emenda o trecho no fim do anterior
      com o fmp4Fixer. */
-  async function tsConverter() {
+  async function tsConverter(outId) {
     if (skipMux) { job0.status('Sem conversor desta vez (a página recarregou ao carregá-lo).'); return null; }
     job0.status('Carregando conversor MP4…');
     var muxjs = await loadMux();
     if (!muxjs) return null;
-    var mux = new muxjs.mp4.Transmuxer(), init = null, buf = [], fx = null, out = new Collector();
+    job0.status('Convertendo para MP4…'); // conversor carregou: a etapa registrada muda
+    var mux = new muxjs.mp4.Transmuxer(), init = null, buf = [], fx = null;
+    // saída: blocos de ~8 MB gravados no armazenamento (outId) para não
+    // acumular o vídeo inteiro na memória; sem outId (ao vivo), na memória
+    var pend = [], pendBytes = 0, refs = [], nOut = 0;
+    async function flushOut(final) {
+      if (!pend.length || (!final && pendBytes < 8388608)) return;
+      var bl = new Blob(pend); pend = []; pendBytes = 0;
+      if (outId) {
+        var k = 'o' + ('00000' + nOut++).slice(-6);
+        await S.put(outId, k, bl);
+        refs.push((await S.get(outId, k)) || bl); // referência no disco
+      } else refs.push(bl);
+    }
     mux.on('data', function (sg) { if (!init) init = new Uint8Array(sg.initSegment); buf.push(new Uint8Array(sg.data)); });
     var prevPts = null, prevDur = 0, first = true, force = false;
     return {
-      push: function (u8, dur, disc) {
+      push: async function (u8, dur, disc) {
         var pts = firstPts(u8), reset = false;
         if (!first) {
           var cont = !disc && !force && pts !== null && prevPts !== null;
@@ -540,15 +586,20 @@
         }
         buf = [];
         mux.push(u8); mux.flush();
+        prevPts = pts; prevDur = dur || prevDur; first = false; force = false;
         if (buf.length) {
           if (!fx) fx = fmp4Fixer(init);
           var seg = concatU8(buf);
-          out.push(fx.fix(seg, dur, reset).data);
+          fx.fix([seg], dur, reset);
+          pend.push(seg); pendBytes += seg.length;
+          await flushOut(false);
         }
-        prevPts = pts; prevDur = dur || prevDur; first = false; force = false;
       },
       skip: function () { force = true; },
-      blob: function () { return init && out.count ? out.blob(setInitDuration(init, fx.end()), 'video/mp4') : null; }
+      blob: async function () {
+        await flushOut(true);
+        return init && refs.length ? new Blob([setInitDuration(init, fx.end())].concat(refs), { type: 'video/mp4' }) : null;
+      }
     };
   }
 
@@ -583,22 +634,43 @@
     });
     return ts;
   }
+  // sidx/styp: índice por segmento com os tempos antigos; num arquivo único
+  // são opcionais e ficariam errados depois da correção de tempo
+  function stripIndex(u8) {
+    var keep = [], dropped = false;
+    boxes(u8, 0, u8.length, function (t, o, b, e) { if (t === 'sidx' || t === 'styp') dropped = true; else keep.push(u8.subarray(o, e)); });
+    return dropped ? concatU8(keep) : u8;
+  }
+
+  /* Lê só os cabeçalhos das caixas de um segmento guardado (sem carregar o
+     vídeo na memória): devolve [{type, start, end}] */
+  async function topBoxes(blob) {
+    var out = [], o = 0, n = blob.size;
+    var head = await blobBytes(blob.slice(0, Math.min(n, 65536)));
+    while (o + 8 <= n) {
+      var h = o + 16 <= head.length ? head.subarray(o, o + 16) : await blobBytes(blob.slice(o, Math.min(n, o + 16)));
+      var dv = new DataView(h.buffer, h.byteOffset, h.byteLength);
+      var size = dv.getUint32(0), type = String.fromCharCode(h[4], h[5], h[6], h[7]);
+      if (size === 1 && h.length >= 16) size = dv.getUint32(8) * 4294967296 + dv.getUint32(12);
+      else if (size === 0) size = n - o;
+      if (size < 8 || o + size > n) throw new Error('parte com formato inválido');
+      out.push({ type: type, start: o, end: o + size });
+      o += size;
+    }
+    return out;
+  }
+
   // Reescreve o tfdt (início de cada fragmento) para manter o tempo contínuo
   function fmp4Fixer(init) {
     var scale = timescales(init), offset = {}, expected = {}, force = false;
     function read(f) { return f.v1 ? f.dv.getUint32(f.pos + 4) * 4294967296 + f.dv.getUint32(f.pos + 8) : f.dv.getUint32(f.pos + 4); }
     return {
-      // devolve os bytes do segmento (corrigidos se preciso) e se mudou algo
-      fix: function (u8, dur, disc) {
-        // sidx/styp: índice por segmento com os tempos antigos; num arquivo
-        // único são opcionais e ficariam errados depois da correção
-        var keep = [], dropped = false;
-        boxes(u8, 0, u8.length, function (t, o, b, e) {
-          if (t === 'sidx' || t === 'styp') dropped = true; else keep.push(u8.subarray(o, e));
-        });
-        if (dropped) u8 = concatU8(keep);
+      // Corrige no lugar os tfdt dos moof de um segmento. "list" é uma lista
+      // de pedaços de bytes que contêm as caixas moof (o mdat não precisa).
+      // Devolve true se mudou algo.
+      fix: function (list, dur, disc) {
         var tfdts = [];
-        boxes(u8, 0, u8.length, function (t, o, b, e) {
+        list.forEach(function (u8) { boxes(u8, 0, u8.length, function (t, o, b, e) {
           if (t !== 'moof') return;
           boxes(u8, b, e, function (t2, o2, b2, e2) {
             if (t2 !== 'traf') return;
@@ -608,7 +680,7 @@
               if (t3 === 'tfdt' && id !== null) tfdts.push({ id: id, pos: b3, v1: u8[b3] === 1, dv: dv });
             });
           });
-        });
+        }); });
         var seen = {}, changed = false;
         tfdts.forEach(function (f) {
           var sc = scale[f.id] || 90000, val = read(f);
@@ -626,7 +698,7 @@
           }
         });
         force = false;
-        return { data: u8, changed: changed || dropped };
+        return changed;
       },
       skip: function () { force = true; },
       // fim do vídeo em segundos (maior fim entre as trilhas)
@@ -674,6 +746,16 @@
 
   async function downloadHls(item, job) {
     job0 = job;
+    job.phase = 'download';
+    // Já baixou tudo antes? Monta direto, sem depender da rede.
+    var ready = (await S.jobs()).filter(function (x) {
+      return x.kind === 'hls' && x.url === item.url && x.complete && !x.done && x.segInfo &&
+        ((x.choice || '') === (item.choice || '') || (item.choiceKey && x.key === item.choiceKey));
+    })[0];
+    if (ready) {
+      item.codec = ready.codec || item.codec;
+      return assembleHls(ready.id, ready.segInfo.map(function (a) { return { dur: a[0], disc: !!a[1] }; }), ready.fmp4, job, false);
+    }
     job.status('Lendo playlist…');
     var url = item.url;
     var text = await fetchText(url, job.signal);
@@ -686,6 +768,7 @@
         m.variants.filter(function (x) { return item.choiceKey && variantKey(x) === item.choiceKey; })[0] || m.variants[0];
       item.choice = v.url;
       item.choiceKey = variantKey(v);
+      item.codec = v.codec;
       if (m.audioSep) note = ' (áudio vem separado neste site; o vídeo pode ficar sem som)';
       url = v.url;
       job.status('Qualidade: ' + variantLabel(v) + note);
@@ -711,7 +794,9 @@
     }
     if (!meta) meta = { id: jobId(item.url, item.choice), v: 2, kind: 'hls', url: item.url, choice: item.choice || '', key: item.choiceKey || '', name: baseName(), t: Date.now(), count: segs.length, have: 0, bytes: 0 };
     var id = meta.id;
-    meta.fmp4 = fmp4; meta.v = 2;
+    meta.fmp4 = fmp4; meta.v = 2; meta.codec = item.codec || '';
+    // duração e descontinuidades de cada parte: permitem montar sem a rede
+    meta.segInfo = segs.map(function (sg) { return [sg.dur, sg.disc ? 1 : 0]; });
     await S.putJob(meta);
     var have = {};
     (await S.keys(id)).forEach(function (i) { have[i] = 1; });
@@ -803,21 +888,31 @@
     return assembleHls(id, segs, fmp4, job, false);
   }
 
-  /* Junta as partes guardadas, lendo uma por vez do armazenamento.
-     Corrige o tempo nas emendas (ver tsConverter/fmp4Fixer). Com skipMissing,
-     pula as partes que não baixaram. */
+  /* Junta as partes guardadas sem carregar o vídeo inteiro na memória:
+     o arquivo final é feito de recortes (slice) das partes no disco; só os
+     cabeçalhos (moof) vão para a memória para corrigir o tempo. Segmentos
+     .ts passam pelo conversor e a saída também vai para o disco aos poucos.
+     Com skipMissing, pula as partes que não baixaram. */
   async function assembleHls(id, segs, fmp4, job, skipMissing) {
-    job.status('Montando arquivo…');
+    job.phase = 'assemble';
+    job.status('Montando o vídeo…');
     var name = ((await S.jobs()).filter(function (x) { return x.id === id; })[0] || {}).name || baseName();
-    var count = segs.length, i, b, missing = 0;
-    var bad = [];
-    // Lê uma parte guardada. Se não existir ou não der para ler, anota para
-    // baixar de novo só ela (ou pula, com skipMissing).
-    async function piece(k) {
-      var x = null, u8 = null;
-      try { x = await S.get(id, k); if (x) u8 = await blobBytes(x); } catch (e) { x = null; }
-      if (!x || !u8) { if (skipMissing) missing++; else bad.push(k); return null; }
-      return { blob: x, u8: u8 };
+    var count = segs.length, i, missing = 0, bad = [];
+    function done(blob, ext) {
+      return { blob: blob, name: name + '.' + ext, id: id, missing: missing };
+    }
+    // Lê uma parte (tenta 2 vezes). Se não existir ou não der para ler,
+    // anota para baixar só ela de novo (ou pula, com skipMissing).
+    async function piece(k, read) {
+      for (var t = 0; t < 2; t++) {
+        try {
+          var x = await S.get(id, k);
+          if (!x) break;
+          return { blob: x, data: await read(x) };
+        } catch (e) { await sleep(500); }
+      }
+      if (skipMissing) missing++; else bad.push(k);
+      return null;
     }
     async function redo() {
       for (var j = 0; j < bad.length; j++) await S.delChunk(id, bad[j]);
@@ -828,40 +923,55 @@
       e.redo = true;
       return e;
     }
-    function done(blob, ext) {
-      return { blob: blob, name: name + '.' + ext, id: id, missing: missing };
-    }
+    function prog(k, what) { if (k % 10 === 0 || k === count - 1) job.progress((k + 1) / count, what + '… ' + (k + 1) + '/' + count); }
+
     if (fmp4) {
-      var initB = await S.get(id, -1), init = initB ? await blobBytes(initB) : null;
+      var initP = await piece(-1, blobBytes);
+      if (!initP && !skipMissing) { bad.push(-1); throw await redo(); }
+      var init = initP ? initP.data : null;
       var fx = fmp4Fixer(init), parts = [];
       for (i = 0; i < count; i++) {
-        b = await piece(i);
-        if (!b) { fx.skip(); continue; }
-        // sem mudança, usa a parte guardada (fica no disco, não na memória)
-        var r = fx.fix(b.u8, segs[i].dur, segs[i].disc);
-        parts.push(r.changed ? new Blob([r.data]) : b.blob);
-        if (i % 20 === 0) job.progress((i + 1) / count, 'Montando… ' + (i + 1) + '/' + count);
+        var p = await piece(i, async function (bl) {
+          var bx = await topBoxes(bl), moofs = [];
+          for (var j = 0; j < bx.length; j++) if (bx[j].type === 'moof') moofs.push({ box: bx[j], u8: await blobBytes(bl.slice(bx[j].start, bx[j].end)) });
+          return { boxes: bx, moofs: moofs };
+        });
+        if (!p) { fx.skip(); continue; }
+        if (bad.length) continue; // vai ter que baixar de novo; só confere as outras
+        var changed = fx.fix(p.data.moofs.map(function (m) { return m.u8; }), segs[i].dur, segs[i].disc);
+        p.data.boxes.forEach(function (bx) {
+          if (bx.type === 'sidx' || bx.type === 'styp') return;
+          var m = p.data.moofs.filter(function (x) { return x.box === bx; })[0];
+          // moof corrigido vem da memória (é pequeno); o resto é recorte do disco
+          parts.push(m && changed ? new Blob([m.u8]) : p.blob.slice(bx.start, bx.end));
+        });
+        prog(i, 'Montando o vídeo');
       }
       if (bad.length) throw await redo();
       if (init) parts.unshift(setInitDuration(init, fx.end()));
       return done(new Blob(parts, { type: 'video/mp4' }), 'mp4');
     }
-    var conv = await tsConverter();
+
+    await S.delOut(id);
+    var conv = await tsConverter(id);
     if (conv) {
       for (i = 0; i < count; i++) {
-        b = await piece(i);
-        if (!b) { conv.skip(); continue; }
-        if (bad.length) continue; // já vai ter que montar de novo; só confere as outras
-        conv.push(b.u8, segs[i].dur, segs[i].disc);
-        job.progress((i + 1) / count, 'Convertendo para MP4… ' + (i + 1) + '/' + count);
+        var q = await piece(i, blobBytes);
+        if (!q) { conv.skip(); continue; }
+        if (bad.length) continue;
+        await conv.push(q.data, segs[i].dur, segs[i].disc);
+        prog(i, 'Convertendo para MP4');
       }
       if (bad.length) throw await redo();
-      var mp4 = conv.blob();
+      var mp4 = await conv.blob();
       if (!mp4) throw fatal('Falha ao converter para MP4');
       return done(mp4, 'mp4');
     }
     var raw = [];
-    for (i = 0; i < count; i++) { b = await piece(i); if (b) raw.push(b.blob); }
+    for (i = 0; i < count; i++) {
+      var r = await piece(i, function (bl) { return blobBytes(bl.slice(0, 188)); });
+      if (r) raw.push(r.blob);
+    }
     if (bad.length) throw await redo();
     return done(new Blob(raw, { type: 'video/mp2t' }), 'ts');
   }
@@ -870,12 +980,13 @@
   async function downloadLive(pl, url, fmp4, job, note) {
     var init = pl.map ? await fetchBytes(pl.map, job.signal) : null;
     var raw = new Collector();
-    var feed = fmp4 ? null : await tsConverter(), fx = fmp4 ? fmp4Fixer(init) : null;
+    var feed = fmp4 ? null : await tsConverter(null), fx = fmp4 ? fmp4Fixer(init) : null;
+    var chain = Promise.resolve();
     var bytes = 0, done = 0;
     function store(buf, seg) {
       bytes += buf.length;
-      if (feed) feed.push(buf, seg.dur, seg.disc);
-      else raw.push(fx ? fx.fix(buf, seg.dur, seg.disc).data : buf);
+      if (feed) chain = chain.then(function () { return feed.push(buf, seg.dur, seg.disc); });
+      else { if (fx) { buf = stripIndex(buf); fx.fix([buf], seg.dur, seg.disc); } raw.push(buf); }
     }
     var last = -1, startedAt = Date.now(), firstRound = true;
     job.live(true);
@@ -899,7 +1010,8 @@
     job.status('Montando arquivo…');
     if (fmp4) return { blob: raw.blob(setInitDuration(init, fx.end()), 'video/mp4'), name: baseName() + '.mp4' };
     if (feed) {
-      var mp4 = feed.blob();
+      await chain;
+      var mp4 = await feed.blob();
       if (!mp4) throw fatal('Falha ao converter para MP4');
       return { blob: mp4, name: baseName() + '.mp4' };
     }
@@ -1204,7 +1316,8 @@
         var fil = el('button', 'g', 'Salvar em Arquivos');
         saveRow.appendChild(gal); saveRow.appendChild(fil);
         saveRow.hidden = false; saveRow.style.display = '';
-        st.textContent = 'Pronto: ' + size + '. Toque em "Salvar na Galeria" e depois em "Salvar Vídeo".';
+        st.textContent = 'Pronto: ' + size + '. Toque em "Salvar na Galeria" e depois em "Salvar Vídeo".' +
+          (item.codec === 'AV1' ? ' Este vídeo é AV1: só toca em iPhone 15 Pro ou mais novo. Se não tocar, baixe uma qualidade H.264 ou HEVC.' : '');
         gal.onclick = function () {
           navigator.share({ files: [file] }).then(function () {
             st.className = 's ok'; st.textContent = 'Enviado. Se escolheu "Salvar Vídeo", ele está no app Fotos.';
@@ -1228,7 +1341,7 @@
           signal: ctrl.signal, stopped: false, saved: !!item.partial, frac: item.partial ? pctOf(item.partial) / 100 : 0,
           status: function (t) { st.className = 's'; st.textContent = t; mark(t); },
           progress: function (f, t) {
-            if (f >= 0) job.frac = f;
+            if (f >= 0 && job.phase !== 'assemble') job.frac = f;
             bar.style.display = 'block';
             bar.classList.toggle('ind', f < 0);
             bar.firstChild.style.width = f < 0 ? '' : Math.floor(f * 100) + '%';
@@ -1258,7 +1371,9 @@
             var retry = !e.fatal && attempt < 4 && (job.saved || (!(e instanceof TypeError) && !/HTTP 4\d\d/.test(msg)));
             if (!retry) { err = e; break; }
             for (var w = [1, 2, 5, 10][attempt]; w > 0 && !ctrl.signal.aborted; w--) {
-              st.className = 's'; st.textContent = (e.redo || e.missing ? e.message + ' ' : 'A conexão falhou. ') +
+              st.className = 's'; st.textContent = (e.redo || e.missing ? e.message + ' ' :
+                job.phase === 'assemble' ? 'Erro ao montar o vídeo (' + msg + '). ' :
+                isNetErr(e) ? 'A conexão falhou. ' : 'Erro (' + msg + '). ') +
                 'Continuando em ' + w + ' s… (' + Math.floor(job.frac * 100) + '% já guardado)';
               await sleep(1000);
             }
@@ -1284,7 +1399,8 @@
         }
         st.className = 's e';
         var m = (err && err.message) || String(err);
-        if (err instanceof TypeError || /fetch|Load failed|NetworkError/i.test(m))
+        if (job.phase === 'assemble' && !err.redo && !err.missing) m = 'Erro ao montar o vídeo: ' + m + '.';
+        else if (isNetErr(err))
           m = pct != null ? 'A conexão caiu.' :
             'O site bloqueou o download pelo navegador. Toque e segure no link azul acima e escolha "Baixar Arquivo Vinculado" (só para arquivos diretos), ou copie o link.';
         if (pct != null) m += ' O que já baixou (' + pct + '%) está guardado: toque em "Continuar" quando quiser' +
