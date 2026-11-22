@@ -196,10 +196,10 @@
        ("Connection to Indexed Database server lost"), por exemplo quando o
        Safari reinicia um processo: reabre e tenta de novo, sem desistir. */
     async function withDb(fn) {
-      for (var t = 0; t < 4; t++) {
+      for (var t = 0; t < 3; t++) {
         var d = await open();
         if (!d) return { ok: false };
-        try { return { ok: true, v: await fn(d) }; }
+        try { return { ok: true, v: await timed(fn(d), 15000, 'acessar o armazenamento') }; }
         catch (e) {
           if (dbp) { try { d.close(); } catch (x) {} dbp = null; }
           await sleep(400 * (t + 1));
@@ -288,7 +288,19 @@
 
   function jobId(url, choice) { return url + '|' + (choice || ''); }
   function fatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
-  async function blobBytes(b) { return new Uint8Array(await new Response(b).arrayBuffer()); }
+  /* No iPhone, o armazenamento do Safari às vezes para de responder (por
+     exemplo depois de trocar de app): a leitura não termina nem dá erro.
+     Toda espera tem limite de tempo; ao estourar, vira erro e é refeita. */
+  function timed(promise, ms, what) {
+    return new Promise(function (res, rej) {
+      var t = setTimeout(function () { rej(new Error('O Safari não respondeu ao ' + what + ' (' + Math.round(ms / 1000) + ' s)')); }, ms);
+      promise.then(function (v) { clearTimeout(t); res(v); }, function (e) { clearTimeout(t); rej(e); });
+    });
+  }
+
+  async function blobBytes(b) {
+    return new Uint8Array(await timed(new Response(b).arrayBuffer(), 30000, 'ler uma parte guardada'));
+  }
 
   /* A galeria (Fotos) só recebe vídeo pela folha de compartilhar do iOS,
      opção "Salvar Vídeo". Ela só aceita MP4/MOV. */
@@ -297,8 +309,10 @@
     var type = ext === 'mov' ? 'video/quicktime' : (ext === 'mp4' || ext === 'm4v') ? 'video/mp4' : '';
     if (!type || typeof File !== 'function' || !navigator.share || !navigator.canShare) return null;
     try {
-      var f = new File([out.blob], out.name, { type: type });
-      return navigator.canShare({ files: [f] }) ? f : null;
+      // confere o suporte com um arquivo vazio do mesmo tipo (rápido); o
+      // arquivo de verdade (pode ter GBs) só é criado no toque do botão
+      if (!navigator.canShare({ files: [new File([], out.name, { type: type })] })) return null;
+      return { make: function () { return new File([out.blob], out.name, { type: type }); } };
     } catch (e) { return null; }
   }
 
@@ -978,14 +992,18 @@
     }
     // Lê uma parte (tenta 2 vezes). Se não existir ou não der para ler,
     // anota para baixar só ela de novo (ou pula, com skipMissing).
+    // Só apaga e baixa de novo uma parte que não existe ou que o Safari diz
+    // estar ilegível. Se o armazenamento não responde, para com erro (a
+    // montagem é refeita) sem apagar nada.
     async function piece(k, read) {
+      var lastErr = null;
       for (var t = 0; t < 2; t++) {
-        try {
-          var x = await S.get(id, k);
-          if (!x) break;
-          return { blob: x, data: await read(x) };
-        } catch (e) { await sleep(500); }
+        var x = await S.get(id, k); // se o armazenamento não responder, o erro sobe
+        if (!x) break;
+        try { return { blob: x, data: await read(x) }; }
+        catch (e) { lastErr = e; await sleep(500); }
       }
+      if (lastErr && !/NotReadable|NotFound|parte com formato/i.test((lastErr.name || '') + ' ' + lastErr.message)) throw lastErr;
       if (skipMissing) missing++; else bad.push(k);
       return null;
     }
@@ -998,7 +1016,7 @@
       e.redo = true;
       return e;
     }
-    function prog(k, what) { if (k % 10 === 0 || k === count - 1) job.progress((k + 1) / count, what + '… ' + (k + 1) + '/' + count); }
+    function prog(k, what) { job.progress((k + 1) / count, what + '… ' + (k + 1) + '/' + count); }
 
     if (fmp4) {
       var initP = await piece(-1, blobBytes);
@@ -1397,7 +1415,9 @@
         st.textContent = 'Pronto: ' + size + '. Toque em "Salvar na Galeria" e depois em "Salvar Vídeo".' +
           (item.codec === 'AV1' ? ' Este vídeo é AV1: só toca em iPhone 15 Pro ou mais novo. Se não tocar, baixe uma qualidade H.264 ou HEVC.' : '');
         gal.onclick = function () {
-          navigator.share({ files: [file] }).then(function () {
+          var f;
+          try { f = file.make(); } catch (e) { st.className = 's e'; st.textContent = 'Não deu para preparar o arquivo: ' + e.message + '. Use "Salvar em Arquivos".'; return; }
+          navigator.share({ files: [f] }).then(function () {
             st.className = 's ok'; st.textContent = 'Enviado. Se escolheu "Salvar Vídeo", ele está no app Fotos.';
           }, function (e) {
             if (e && e.name === 'AbortError') return; // fechou a folha sem escolher
