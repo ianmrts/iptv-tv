@@ -1341,7 +1341,10 @@
           signal: ctrl.signal, stopped: false, saved: !!item.partial, frac: item.partial ? pctOf(item.partial) / 100 : 0,
           status: function (t) { st.className = 's'; st.textContent = t; mark(t); },
           progress: function (f, t) {
-            if (f >= 0 && job.phase !== 'assemble') job.frac = f;
+            // A barra e o "% guardado" mostram só o download. Na montagem a
+            // barra fica onde está (cheia) e o progresso aparece no texto.
+            if (job.phase === 'assemble') f = job.frac;
+            else if (f >= 0) job.frac = f;
             bar.style.display = 'block';
             bar.classList.toggle('ind', f < 0);
             bar.firstChild.style.width = f < 0 ? '' : Math.floor(f * 100) + '%';
@@ -1386,7 +1389,7 @@
           if (out.id) { finishedHere[out.id] = 1; markDone(out.id); }
           item.partial = null;
           idle(null);
-          job.progress(1);
+          job.phase = 'done'; job.progress(1);
           offerSave(out);
           return;
         }
@@ -1421,7 +1424,7 @@
               finishedHere[h.id] = 1; markDone(h.id);
               item.partial = null;
               idle(null);
-              job.progress(1);
+              job.phase = 'done'; job.progress(1);
               offerSave(out2);
               st.textContent = st.textContent.replace('Pronto: ', 'Pronto (sem ' + out2.missing + ' de ' + h.segs.length + ' partes): ');
             } catch (e2) {
